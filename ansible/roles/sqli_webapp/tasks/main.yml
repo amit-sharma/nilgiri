@@ -1,0 +1,9 @@
+---
+# sqli_webapp (M5) -- entrypoint runs on web.oscar (the role's "home"
+# host: IIS + vulnerable ASP.NET search). The playbook (m5_sqli_webapp.yml)
+# invokes the three other stages on dc1.oscar, db.oscar, and
+# operator-ws1 via include_role/tasks_from. See defaults/main.yml for
+# the full attack-chain walkthrough comment.
+
+- name: Run web.oscar tasks (IIS + ASP.NET + app pool as svc_searchapp)
+  ansible.builtin.include_tasks: web_oscar_setup.yml

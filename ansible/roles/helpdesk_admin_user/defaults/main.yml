@@ -1,0 +1,20 @@
+---
+# helpdesk_admin_user (M4) -- runs on dc1.charlie. Creates the privileged
+# domain user the M4 browser-bot scheduled task on wiki.charlie logs in as.
+# The XSS coerces an NTLM auth from this user; ntlmrelayx relays it to
+# fs.charlie, where the user can write HKLM\SOFTWARE\Nilgiri\RelayWin
+# (the M4.s2 flag). The user is also a MediaWiki sysop (editinterface), so
+# the CSRF payload writes/reads the interface message carrying M4.s1.
+
+helpdesk_admin_user_domain: charlie.local
+helpdesk_admin_user_sam: helpdesk.admin
+helpdesk_admin_user_firstname: Helpdesk
+helpdesk_admin_user_surname: Admin
+helpdesk_admin_user_upn: "helpdesk.admin@charlie.local"
+helpdesk_admin_user_path: "OU=Crownlands,DC=charlie,DC=local"
+helpdesk_admin_user_description: >-
+  IT helpdesk service account. Used by the wiki browser-check job. Do not
+  log in interactively.
+
+# Gate for the M4 scheduled task -- NOT a flag, not meant to be cracked.
+helpdesk_admin_user_password: "H3lpd3sk-Adm-2026-Wi5tful-Ravens"

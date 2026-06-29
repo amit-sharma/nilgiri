@@ -1,0 +1,61 @@
+---
+# Join the non-GOAD-managed Windows VMs to their domains:
+#   wiki.charlie, areuben-ws -> charlie.local; web.oscar, db.oscar, operator-ws1 -> oscar.local
+# Local Administrator password is left unchanged (the packer-baked value).
+
+- name: Join charlie members
+  hosts: wiki.charlie,areuben-ws
+  gather_facts: false
+  tasks:
+    - name: Point DNS at the charlie DC before join
+      ansible.windows.win_dns_client:
+        adapter_names: "Ethernet 2"
+        dns_servers:
+          - 10.20.0.10
+
+    - name: Join domain charlie.local
+      microsoft.ad.membership:
+        dns_domain_name: charlie.local
+        domain_admin_user: administrator@charlie.local
+        domain_admin_password: 8dCT-DJjgScp
+        state: domain
+        reboot: false
+      register: join_charlie
+
+    - name: Reboot after join
+      ansible.windows.win_reboot:
+        reboot_timeout: 900
+        post_reboot_delay: 60
+      when: join_charlie.reboot_required
+
+- name: Join oscar members
+  hosts: web.oscar,db.oscar,operator-ws1
+  gather_facts: false
+  tasks:
+    - name: Point DNS at the oscar DC before join
+      ansible.windows.win_dns_client:
+        adapter_names: "Ethernet 2"
+        dns_servers:
+          - 10.30.0.10
+
+    # NetBIOS short name forces IPC$ over \\DC01-OSCAR; the FQDN SMB path fails
+    # with ERROR_NETNAME_DELETED here.
+    - name: Join domain oscar.local (via NetBIOS short name)
+      ansible.windows.win_shell: |
+        $r = Get-CimInstance Win32_ComputerSystem
+        if ($r.PartOfDomain -and $r.Domain -eq 'oscar.local') {
+          "ALREADY-JOINED"
+        } else {
+          $sec = ConvertTo-SecureString 'NgtI75cKV+Pu' -AsPlainText -Force
+          $c   = New-Object System.Management.Automation.PSCredential('OSCAR\administrator', $sec)
+          Add-Computer -DomainName 'oscar.local' -Server 'DC01-OSCAR' -Credential $c -Restart:$false -Force -ErrorAction Stop
+          "JOINED"
+        }
+      register: join_oscar
+      changed_when: "'JOINED' in join_oscar.stdout"
+
+    - name: Reboot after join
+      ansible.windows.win_reboot:
+        reboot_timeout: 900
+        post_reboot_delay: 60
+      when: join_oscar.changed

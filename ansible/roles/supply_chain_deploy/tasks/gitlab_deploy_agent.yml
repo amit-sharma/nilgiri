@@ -1,0 +1,43 @@
+---
+# gitlab_deploy_agent.yml (M8) -- seed the apps/deploy-agent project on the
+# GitLab stood up by the M7 gitlab_cicd role. Idempotent; prints CREATED.
+
+- name: Verify the GitLab container is up (M7 gitlab_cicd ran first)
+  ansible.builtin.command: "docker exec {{ sc_gitlab_container }} curl -sf http://localhost/-/readiness"
+  become: true
+  register: sc_gl_ready
+  retries: 30
+  delay: 10
+  until: sc_gl_ready.rc == 0
+  changed_when: false
+
+- name: Stage the deploy-agent rails provisioning script
+  ansible.builtin.template:
+    src: deploy_agent_provision.rb.j2
+    dest: "{{ sc_gitlab_data_dir }}/deploy_agent_provision.rb"
+    mode: "0640"
+  become: true
+
+- name: Copy provisioning script into the container + make it readable
+  ansible.builtin.shell: |
+    docker cp {{ sc_gitlab_data_dir }}/deploy_agent_provision.rb {{ sc_gitlab_container }}:/tmp/deploy_agent_provision.rb
+    docker exec {{ sc_gitlab_container }} chmod 644 /tmp/deploy_agent_provision.rb
+  become: true
+  changed_when: false
+
+- name: Run the deploy-agent rails provisioning (idempotent)
+  ansible.builtin.command:
+    cmd: "docker exec {{ sc_gitlab_container }} gitlab-rails runner /tmp/deploy_agent_provision.rb"
+  become: true
+  register: sc_prov
+  changed_when: "'CREATED' in sc_prov.stdout"
+
+- name: Show deploy-agent provisioning output
+  ansible.builtin.debug:
+    var: sc_prov.stdout_lines
+
+- name: Verify the offline dotnet image was streamed in (bake)
+  ansible.builtin.shell: "docker image inspect {{ sc_dotnet_image }} >/dev/null 2>&1"
+  register: sc_dotnet_img
+  changed_when: false
+  failed_when: sc_dotnet_img.rc != 0

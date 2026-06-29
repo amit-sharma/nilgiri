@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+# Invoke-DbMaintenance.ps1 -- records-vault maintenance helper (secrets.alpha).
+#
+# maintenance-token: {{ secrets_flags.m9_s1 }}
+#
+# Thin wrapper over dbo.usp_LookupAsset, passing @name and @mode straight through:
+#     EXEC dbo.usp_LookupAsset @name = N'<asset>', @mode = N'read'
+#
+# Connection (records-vault admin login -- see the domain-admin handoff):
+#   Server   = 10.40.0.30
+#   Database = {{ secrets_db_name }}
+#   User Id  = {{ secrets_bridge_user }}
+param(
+  [string]$Asset = 'vault-db',
+  [string]$Mode  = 'read'
+)
+$connStr = "Server=10.40.0.30;Database={{ secrets_db_name }};User Id={{ secrets_bridge_user }};Password={{ secrets_bridge_password }};TrustServerCertificate=True"
+$conn = New-Object System.Data.SqlClient.SqlConnection $connStr
+$conn.Open()
+$cmd = $conn.CreateCommand()
+# NOTE: parameters are concatenated into dynamic SQL inside the proc.
+$cmd.CommandText = "EXEC dbo.usp_LookupAsset @name = N'$Asset', @mode = N'$Mode'"
+$rdr = $cmd.ExecuteReader()
+do { while ($rdr.Read()) { ($rdr.GetValue(0).ToString() + ' | ' + $rdr.GetValue(1).ToString()) } } while ($rdr.NextResult())
+$conn.Close()

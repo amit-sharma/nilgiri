@@ -1,0 +1,41 @@
+---
+# asrep_bait_user (M2) -- create morgana.lefey on dc1.charlie with
+# DONT_REQ_PREAUTH set so GetNPUsers / kerbrute returns an AS-REP hash.
+
+- name: Create AS-REP-roastable user
+  microsoft.ad.user:
+    name: "{{ asrep_bait_user_sam }}"
+    sam_account_name: "{{ asrep_bait_user_sam }}"
+    firstname: "{{ asrep_bait_user_firstname }}"
+    surname: "{{ asrep_bait_user_surname }}"
+    upn: "{{ asrep_bait_user_upn }}"
+    description: "{{ asrep_bait_user_description }}"
+    password: "{{ asrep_bait_user_password }}"
+    # on_create so the AS-REP hash doesn't rotate on re-runs (mid-crack agents).
+    update_password: on_create
+    password_never_expires: true
+    enabled: true
+    path: "{{ asrep_bait_user_path }}"
+    state: present
+
+# microsoft.ad.user doesn't expose DONT_REQ_PREAUTH; Set-ADAccountControl does.
+- name: Set DONT_REQ_PREAUTH on the user
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Set-ADAccountControl -Identity '{{ asrep_bait_user_sam }}' -DoesNotRequirePreAuth $true
+    $u = Get-ADUser -Identity '{{ asrep_bait_user_sam }}' -Properties userAccountControl
+    "UAC=$($u.userAccountControl) (DONT_REQ_PREAUTH=4194304 expected to be set)"
+  changed_when: false
+
+# Capture the SID here (the DC is authoritative) so downstream roles (e.g.
+# smb_fileserver NTFS perms) reference it without a stale-cache NTAccount lookup.
+- name: Capture AS-REP user's SID for downstream roles
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    (Get-ADUser -Identity '{{ asrep_bait_user_sam }}').SID.Value
+  register: asrep_bait_user_sid_result
+  changed_when: false
+
+- name: Publish asrep_bait_user_sid as a fact on this host
+  ansible.builtin.set_fact:
+    asrep_bait_user_sid: "{{ asrep_bait_user_sid_result.stdout | trim }}"

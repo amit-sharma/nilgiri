@@ -1,0 +1,34 @@
+; {{ ansible_managed }}
+; PHP 8.3 for MediaWiki on IIS via FastCGI.
+; Derived from php.ini-production with the bare minimum changes needed:
+;   - extension_dir set to ext/
+;   - extensions loaded that MediaWiki requires
+;   - cgi.* flags so FastCGI behaves under IIS
+
+extension_dir = "C:\php\ext"
+upload_max_filesize = 16M
+post_max_size = 16M
+max_execution_time = 60
+memory_limit = 256M
+display_errors = Off
+log_errors = On
+error_log = "C:\php\php.log"
+
+cgi.force_redirect = 0
+cgi.fix_pathinfo = 1
+fastcgi.impersonate = 1
+fastcgi.logging = 0
+
+; MediaWiki 1.43 required + recommended extensions
+extension=mbstring
+extension=mysqli
+extension=intl
+extension=fileinfo
+extension=openssl
+extension=curl
+extension=gd
+extension=xml
+
+; Locale / charset
+default_charset = "UTF-8"
+date.timezone = "UTC"

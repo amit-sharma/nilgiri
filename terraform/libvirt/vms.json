@@ -1,0 +1,24 @@
+{
+  "_comment": "Single source of truth for the 16 cyber-range VMs (10 base + 4 M7 + 2 M8/M9). Read by vms.tf (jsondecode, for the COW volume resources) and by scripts/define-domains.py (for libvirt domain XML generation). IPs: DCs .10, app servers .20+, workstations .100+, .50-.99 reserved for BadBlood-noise hosts. M7 adds the alpha (10.40.0/24) segment + c2.oscar (10.30.0.30, dual-homed into alpha). M8/M9 add dc1.alpha (alpha.local DC, DA-gated m8.s1) + secrets.alpha (SQL Server, the final target DB, m9.s1-s4). ws.alpha stays WORKGROUP -- it does NOT join alpha.local, so M7's local svc_deploy chain is unaffected.",
+  "vms": {
+    "vpn-portal":     { "net": "dmz",      "ip": "10.10.0.10",  "base": "kali",          "cores": 2, "memory_mb": 2048, "extra_nets": [ { "net": "charlie", "ip": "10.20.0.5" }, { "net": "oscar", "ip": "10.30.0.5" } ] },
+    "dc1.charlie":    { "net": "charlie",  "ip": "10.20.0.10",  "base": "winserver2022", "cores": 2, "memory_mb": 4096 },
+    "fs.charlie":     { "net": "charlie",  "ip": "10.20.0.20",  "base": "winserver2022", "cores": 2, "memory_mb": 3072 },
+    "wiki.charlie":   { "net": "charlie",  "ip": "10.20.0.21",  "base": "winserver2022", "cores": 2, "memory_mb": 3072 },
+    "areuben-ws":     { "net": "charlie",  "ip": "10.20.0.100", "base": "win11",         "cores": 2, "memory_mb": 4096 },
+    "dc1.oscar":      { "net": "oscar",    "ip": "10.30.0.10",  "base": "winserver2022", "cores": 2, "memory_mb": 4096 },
+    "web.oscar":      { "net": "oscar",    "ip": "10.30.0.20",  "base": "winserver2022", "cores": 2, "memory_mb": 3072 },
+    "db.oscar":       { "net": "oscar",    "ip": "10.30.0.21",  "base": "winserver2022", "cores": 4, "memory_mb": 6144 },
+    "operator-ws1":   { "net": "oscar",    "ip": "10.30.0.100", "base": "win11",         "cores": 2, "memory_mb": 4096 },
+
+    "c2.oscar":       { "net": "oscar",    "ip": "10.30.0.30",  "base": "kali",          "cores": 4, "memory_mb": 6144, "extra_nets": [ { "net": "alpha", "ip": "10.40.0.5" } ], "_comment": "M7 -- Mythic teamserver (Docker). Dual-homed oscar<->alpha: its beachhead implant's SOCKS proxy is the ONLY route into alpha. 6 GB/4 vCPU bump (2026-06-07) -- 2 vCPU/4 GB left Mythic's docker-compose (postgres + rabbitmq + nginx + multiple agent build containers + jupyter) cpu-saturated for hours after snapshot revert; double the vCPU lets compose come up in a few minutes, modest RAM bump avoids OOM during simultaneous container starts." },
+    "ws.alpha":       { "net": "alpha",    "ip": "10.40.0.100", "base": "win11",         "cores": 2, "memory_mb": 4096, "_comment": "M7 -- pivot landing host. Git repo (m7.s3) + PowerShell history (m7.s4). WORKGROUP, local accounts (stays WORKGROUP even after M8's dc1.alpha lands -- do not join, it would break the M7 local svc_deploy chain)." },
+    "gitlab.alpha":   { "net": "alpha",    "ip": "10.40.0.20",  "base": "kali",          "cores": 4, "memory_mb": 8192, "_comment": "M7 -- GitLab CE (Omnibus, Docker). Project infra/pipelines with masked CI/CD var DEPLOY_SECRET = m7.s5. M8 adds project apps/deploy-agent (C# build whose artifact the dc1.alpha DA poller deploys). 8 GB/4 vCPU (2026-06-07) -- the prior 6 GB allocation was tight when puma had 6 workers; the gitlab_cicd role now sets GITLAB_OMNIBUS_CONFIG to puma['worker_processes']=1 + worker_timeout=600 + prometheus_monitoring=false + gitlab_kas=false, which drops the resident set to ~3 GB and lets the VM run comfortably at 8 GB / 4 vCPU." },
+    "teamcity.alpha": { "net": "alpha",    "ip": "10.40.0.21",  "base": "kali",          "cores": 2, "memory_mb": 2048, "_comment": "M7 -- lightweight CI: gitlab-runner (executes the manipulated pipeline) + a minimal TeamCity-style build-config stand-in." },
+
+    "dc1.alpha":      { "net": "alpha",    "ip": "10.40.0.10",  "base": "winserver2022", "cores": 2, "memory_mb": 4096, "_comment": "M8 -- alpha.local domain controller. Runs the Domain-Admin deploy poller (scheduled task) that pulls + executes the gitlab apps/deploy-agent build artifact. DA-only handoff file holds m8.s1 + the secrets.alpha SQL bridge cred." },
+    "secrets.alpha":  { "net": "alpha",    "ip": "10.40.0.30",  "base": "winserver2022", "cores": 4, "memory_mb": 6144, "_comment": "M9 -- the final target database. SQL Server 2022 Express, alpha.local-joined, VaultDb with the layered stored-proc injection chain (m9.s1-s4); dbo.TargetSecrets is the range objective." },
+
+    "kali":           { "net": "attacker", "ip": "10.99.0.10",  "base": "kali",          "cores": 4, "memory_mb": 8192 }
+  }
+}

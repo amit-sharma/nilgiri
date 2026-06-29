@@ -1,0 +1,44 @@
+---
+# Durably set LDAPServerIntegrity=2 (+ LdapEnforceChannelBinding=2) by editing the
+# Default Domain Controllers Policy's GptTmpl.inf in SYSVOL on each DC.
+#
+# Needed because charlie.local + oscar.local ship a DDCP GptTmpl.inf line
+# (LDAPServerIntegrity=4,1) that Group Policy reapplies on every refresh,
+# clobbering the win_regedit value from harden_ad_relay.yml back to 1.
+# alpha.local lacks this line, so it is a no-op there; charlie + oscar get
+# the durable fix. Idempotent across reboots and gpupdate cycles.
+
+- name: Patch Default Domain Controllers Policy in SYSVOL for LDAP signing
+  hosts:
+    - dc1.charlie
+    - dc1.oscar
+    - dc1.alpha
+  gather_facts: false
+  tasks:
+    - name: Stage patch_ddcp_ldap_signing.ps1 onto each DC
+      ansible.windows.win_copy:
+        src: files/patch_ddcp_ldap_signing.ps1
+        dest: C:\Windows\Temp\patch_ddcp_ldap_signing.ps1
+
+    - name: Run the patch script
+      ansible.windows.win_shell: |
+        powershell -ExecutionPolicy Bypass -File C:\Windows\Temp\patch_ddcp_ldap_signing.ps1
+      register: patch_result
+      changed_when: "'patched' in patch_result.stdout"
+
+    - name: Show post-patch state
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ patch_result.stdout_lines | last }}"
+
+    - name: Assert LDAP signing is now required
+      ansible.builtin.assert:
+        that:
+          - "'LDAPServerIntegrity=2' in patch_result.stdout"
+          - "'LdapEnforceChannelBinding=2' in patch_result.stdout"
+        fail_msg: >-
+          Patch ran but live registry still reports
+          "{{ patch_result.stdout_lines | last }}". Another GPO linked to the
+          Domain Controllers OU may still be overriding. Look under
+          C:\Windows\SYSVOL\domain\Policies for additional GptTmpl.inf files
+          that mention LDAPServerIntegrity, or check `Get-GPInheritance
+          -Target 'OU=Domain Controllers,DC=...'`.

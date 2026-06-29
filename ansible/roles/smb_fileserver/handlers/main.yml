@@ -1,0 +1,5 @@
+---
+- name: reload lanmanserver
+  ansible.windows.win_service:
+    name: LanmanServer
+    state: restarted

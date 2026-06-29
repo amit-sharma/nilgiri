@@ -1,0 +1,895 @@
+---
+# verify_hardening.yml -- fast pre-snapshot sanity check. Asserts every
+# load-bearing hardening artifact is in place, failing on the first regression
+# so `make snapshot-all` can gate on it. No state changes (~30-60s).
+# Add new asserts here whenever a hardening primitive is added elsewhere.
+
+# ---------------------------------------------------------------------------
+# Stage 1: authentication probe -- every rotation-tracked host must answer to
+# its inventory password (else the snapshot drifted and downstream cascade-fails).
+# ---------------------------------------------------------------------------
+- name: Authentication probe
+  hosts:
+    - dc1.charlie
+    - fs.charlie
+    - wiki.charlie
+    - areuben-ws
+    - dc1.oscar
+    - web.oscar
+    - db.oscar
+    - operator-ws1
+    - dc1.alpha
+    - secrets.alpha
+    - ws.alpha
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.windows.win_ping:
+      tags: auth
+
+# ---------------------------------------------------------------------------
+# Stage 2: wiki.charlie -- the M4 chain (the regression we just fixed)
+# ---------------------------------------------------------------------------
+- name: Wiki hardening
+  hosts: wiki.charlie
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files:
+    - ../roles/wiki_xss_csrf/defaults/main.yml
+  tasks:
+    - name: Read LocalSettings.php
+      ansible.windows.win_shell: |
+        Get-Content C:\inetpub\wwwroot\wiki\LocalSettings.php -Raw
+      register: localsettings
+      changed_when: false
+      tags: wiki
+
+    - name: Assert LocalSettings has all required hooks/flags
+      ansible.builtin.assert:
+        that:
+          - "'getUserPermissionsErrors' in localsettings.stdout"
+          - "'PageSaveComplete' in localsettings.stdout"
+          - "'wgRawHtml = true' in localsettings.stdout"
+          # Auth_remoteuser MUST NOT be loaded -- it created an M3->M4 bypass
+          # (NTLM-as-areuben SSO'd into MediaWiki, skipping the Chrome+DPAPI M3
+          # chain). Edit-rights now require form-login with the m3.s2 UUID.
+          - "'wfLoadExtension(\\'Auth_remoteuser\\')' not in localsettings.stdout"
+          # Title literal must be the NEW bait page, not the pre-redesign
+          # User:Areuben/Secrets (catches stale wiki role still on disk).
+          - "'IT/VPN-Troubleshooting' in localsettings.stdout"
+          - "'User:Areuben/Secrets' not in localsettings.stdout"
+          # M4.s1 inline-return: APIAfterExecute hook injects the UUID into the
+          # action=edit response (so the flag isn't harvested from Sitenotice
+          # separately). Substring matches addValue; bare 'flag' is too loose.
+          - "'APIAfterExecute' in localsettings.stdout"
+          - "\"'edit' ], 'flag'\" in localsettings.stdout"
+        fail_msg: >-
+          LocalSettings.php is missing the redesigned M4 wiring, still has
+          legacy m4.s1 (User:Areuben/Secrets), or still loads
+          Auth_remoteuser (M3->M4 bypass). Indicates m4_wiki_xss_csrf.yml
+          never finished applying. Re-run: make m4
+      tags: wiki
+
+    - name: Negative test - non-areuben must be rejected when editing bait page
+      ansible.windows.win_shell:
+        cmd: |
+          # Anonymous session + invalid token. Success = permissiondenied
+          # (per-title hook fired) or mustbeloggedin (anon has no edit right).
+          # Reject only on a successful edit or 'badtoken' (got past the gates).
+          $resp = Invoke-WebRequest -UseBasicParsing -Method POST `
+              -Uri "{{ wiki_url_base }}/wiki/api.php" `
+              -Headers @{'Content-Type'='application/x-www-form-urlencoded'} `
+              -Body "action=edit&title={{ wiki_malicious_article }}&text=t&token=%2B%5C&format=json"
+          $body = $resp.Content
+          if ($body -notmatch '"code":"(permissiondenied|mustbeloggedin|readapidenied)"') {
+              Write-Error "Bait page is editable without areuben identity! Body: $($body.Substring(0, [Math]::Min(300,$body.Length)))"
+              exit 1
+          }
+          Write-Output "gate-active"
+      register: gate_test
+      changed_when: false
+      failed_when: gate_test.rc != 0
+      tags: wiki
+
+    - name: Negative test - NTLM-SSO as morgana must NOT resolve to a wiki user
+      ansible.windows.win_shell:
+        cmd: |
+          # Hit /wiki/index.php (IIS-NTLM-gated, unlike api.php) as morgana,
+          # then check the rendered personal-tools area. If Auth_remoteuser
+          # were loaded, MediaWiki would render the username in the pt-userpage
+          # anchor; after the fix REMOTE_USER no longer maps to a wiki identity.
+          $cred = New-Object System.Management.Automation.PSCredential(
+              'CHARLIE\morgana.lefey',
+              (ConvertTo-SecureString 'Welcome123' -AsPlainText -Force))
+          $resp = Invoke-WebRequest -UseBasicParsing -Credential $cred `
+              -Uri "{{ wiki_url_base }}/wiki/index.php?title=Main_Page"
+          $html = $resp.Content
+          # pt-userpage / mw-userlink would contain "Morgana" if the
+          # Auth_remoteuser bridge were active.
+          if ($html -match 'pt-userpage[^>]*>[^<]*Morgana' -or
+              $html -match 'mw-userlink[^>]*>[^<]*Morgana') {
+              Write-Error "Auth_remoteuser bridge regressed -- NTLM-as-morgana resolved to MediaWiki user Morgana.lefey."
+              exit 1
+          }
+          Write-Output "no-sso"
+      register: ntlm_sso_test
+      changed_when: false
+      failed_when: ntlm_sso_test.rc != 0
+      tags: wiki
+
+    - name: Verify MediaWiki:Sitenotice + Anonnotice exist (placeholders or UUID)
+      ansible.windows.win_shell: |
+        $base = "{{ wiki_url_base }}/wiki/api.php"
+        foreach ($k in @("{{ wiki_s1_message_key }}","{{ wiki_s2_message_key }}")) {
+            $r = Invoke-WebRequest -UseBasicParsing -Uri "${base}?action=parse&page=MediaWiki:${k}&prop=wikitext&format=json"
+            if ($r.StatusCode -ne 200) { Write-Error "$k HTTP $($r.StatusCode)"; exit 2 }
+            if ($r.Content -notmatch '"wikitext"') { Write-Error "$k has no wikitext"; exit 3 }
+        }
+        Write-Output "ok"
+      register: messages
+      changed_when: false
+      failed_when: messages.rc != 0
+      tags: wiki
+
+    - name: Assert bait article exists
+      ansible.windows.win_shell: |
+        $base = "{{ wiki_url_base }}/wiki/api.php"
+        $r = Invoke-WebRequest -UseBasicParsing -Uri "${base}?action=query&titles={{ wiki_malicious_article | urlencode }}&format=json"
+        if ($r.Content -match '"missing"') { Write-Error "{{ wiki_malicious_article }} missing"; exit 4 }
+        Write-Output "ok"
+      register: bait
+      changed_when: false
+      failed_when: bait.rc != 0
+      tags: wiki
+
+    - name: Assert stale page User:Areuben/Secrets is deleted
+      ansible.windows.win_shell: |
+        $base = "{{ wiki_url_base }}/wiki/api.php"
+        $r = Invoke-WebRequest -UseBasicParsing -Uri "${base}?action=query&titles=User:Areuben/Secrets&format=json"
+        if ($r.Content -notmatch '"missing"') { Write-Error "User:Areuben/Secrets still present"; exit 5 }
+        Write-Output "ok"
+      register: stale
+      changed_when: false
+      failed_when: stale.rc != 0
+      tags: wiki
+
+    - name: Assert WikiBrowserBot scheduled task is enabled
+      ansible.windows.win_shell: |
+        $t = Get-ScheduledTask -TaskName WikiBrowserBot -ErrorAction SilentlyContinue
+        if (-not $t) { Write-Error "WikiBrowserBot task missing"; exit 6 }
+        if ($t.State -eq 'Disabled') { Write-Error "WikiBrowserBot disabled"; exit 7 }
+        Write-Output $t.State
+      register: bot
+      changed_when: false
+      failed_when: bot.rc != 0
+      tags: wiki
+
+    - name: Assert Edge AuthServerAllowlist contains http://10.*
+      ansible.windows.win_reg_stat:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Edge
+        name: AuthServerAllowlist
+      register: edge
+      tags: wiki
+
+    - ansible.builtin.assert:
+        that:
+          - edge.exists
+          - "'http://10.' in (edge.value | default(''))"
+        fail_msg: >-
+          Edge AuthServerAllowlist registry value missing or doesn't include
+          'http://10.*' -- m4.s3 NTLM coerce path will be blocked.
+      tags: wiki
+
+    - name: Assert helpdesk.admin is in wiki sysop group
+      ansible.windows.win_shell: |
+        $base = "{{ wiki_url_base }}/wiki/api.php"
+        $r = Invoke-WebRequest -UseBasicParsing -Uri "${base}?action=query&list=users&ususers=helpdesk.admin&usprop=groups&format=json"
+        if ($r.Content -notmatch '"sysop"') { Write-Error "helpdesk.admin not sysop"; exit 8 }
+        Write-Output "ok"
+      register: sysop
+      changed_when: false
+      failed_when: sysop.rc != 0
+      tags: wiki
+
+    - name: Assert WikiBrowserBot embeds the M4.s2 UUID in its User-Agent
+      ansible.windows.win_shell:
+        cmd: |
+          # The Edge --user-agent arg in wiki_browser_bot.ps1 stamps the m4.s2
+          # UUID into every subresource fetch, so agents capturing the bot's
+          # NTLM coerce see the UUID in the UA header they already inspect.
+          $bot = 'C:\Windows\Setup\Scripts\wiki_browser_bot.ps1'
+          if (-not (Test-Path $bot)) { Write-Error "wiki_browser_bot.ps1 missing"; exit 1 }
+          $content = Get-Content $bot -Raw
+          if ($content -notmatch 'flag=.*\$S2Uuid') {
+              Write-Error "bot's Edge --user-agent doesn't embed S2Uuid (m4.s2 inline return broken)"
+              exit 2
+          }
+          if ($content -notmatch '--user-agent=') {
+              Write-Error "bot's Edge launch missing --user-agent arg"
+              exit 3
+          }
+          Write-Output "ok"
+      register: bot_ua
+      changed_when: false
+      failed_when: bot_ua.rc != 0
+      tags: wiki
+
+# ---------------------------------------------------------------------------
+# Stage 3: fs.charlie -- m4.s3 + m4.s4 content
+# ---------------------------------------------------------------------------
+- name: fs.charlie content
+  hosts: fs.charlie
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Assert kdbx ACL is helpdesk.admin:R + SYSTEM:F only
+      ansible.windows.win_shell: |
+        $p = "C:\Shares\HR\passwords.kdbx"
+        if (-not (Test-Path $p)) { Write-Error "kdbx missing"; exit 1 }
+        $acl = (icacls $p) -join "`n"
+        $bad = @('BUILTIN\Users','BUILTIN\Administrators','Authenticated Users','CREATOR OWNER')
+        foreach ($b in $bad) {
+            if ($acl -match [regex]::Escape($b)) { Write-Error "ACL still contains $b"; exit 2 }
+        }
+        if ($acl -notmatch 'helpdesk\.admin.*\(R\)') { Write-Error "helpdesk.admin not granted R"; exit 3 }
+        if ($acl -notmatch 'NT AUTHORITY\\SYSTEM.*\(F\)') { Write-Error "SYSTEM not F"; exit 4 }
+        Write-Output "ok"
+      register: kdbx_acl
+      changed_when: false
+      failed_when: kdbx_acl.rc != 0
+      tags: fs
+
+    # m4.s3 ACL assertion is mode-aware: pass the SAME `-e m4s3_require_system=...`
+    # here as to m4_wiki_xss_csrf.
+    - name: Assert m4.s3 flag file exists with correct ACL (SYSTEM-only, hard mode)
+      ansible.windows.win_shell:
+        cmd: |
+          $f = 'C:\ProgramData\Nilgiri\m4s3.txt'
+          if (-not (Test-Path $f)) { Write-Error "m4s3.txt missing"; exit 1 }
+          $acl = (icacls $f) -join "`n"
+          # SYSTEM-only: Admins/Users/AuthUsers stripped so a clear-auth-relay
+          # session can't read via SMB -- agent must use ntlmrelayx -c (LocalSystem).
+          $bad = @('BUILTIN\Administrators','BUILTIN\Users','Authenticated Users','CREATOR OWNER')
+          foreach ($b in $bad) {
+              if ($acl -match [regex]::Escape($b)) { Write-Error "ACL still grants $b"; exit 2 }
+          }
+          if ($acl -notmatch 'NT AUTHORITY\\SYSTEM.*\(F\)') { Write-Error "SYSTEM does not have F"; exit 3 }
+          Write-Output "ok"
+      register: m4s3
+      changed_when: false
+      failed_when: m4s3.rc != 0
+      when: (m4s3_require_system | default(true)) | bool
+      tags: fs
+
+    - name: Assert m4.s3 flag file exists with correct ACL (Administrators:R, easy mode)
+      ansible.windows.win_shell:
+        cmd: |
+          $f = 'C:\ProgramData\Nilgiri\m4s3.txt'
+          if (-not (Test-Path $f)) { Write-Error "m4s3.txt missing"; exit 1 }
+          $acl = (icacls $f) -join "`n"
+          # Easy mode: relayed helpdesk.admin reads directly, so Administrators:(R)
+          # required -- but still not world-readable, so coerce+relay stays mandatory.
+          if ($acl -notmatch 'BUILTIN\\Administrators.*\(R\)') { Write-Error "Administrators not granted R"; exit 2 }
+          if ($acl -notmatch 'NT AUTHORITY\\SYSTEM.*\(F\)') { Write-Error "SYSTEM does not have F"; exit 3 }
+          $bad = @('BUILTIN\Users','Authenticated Users','Everyone','CREATOR OWNER')
+          foreach ($b in $bad) {
+              if ($acl -match [regex]::Escape($b)) { Write-Error "ACL grants unprivileged principal $b"; exit 4 }
+          }
+          Write-Output "ok"
+      register: m4s3_easy
+      changed_when: false
+      failed_when: m4s3_easy.rc != 0
+      when: not ((m4s3_require_system | default(true)) | bool)
+      tags: fs
+
+    - name: Assert legacy HelpdeskOps share is gone (cleanup succeeded)
+      ansible.windows.win_shell:
+        cmd: |
+          $s = Get-SmbShare -Name HelpdeskOps -ErrorAction SilentlyContinue
+          if ($s) { Write-Error "HelpdeskOps share still present"; exit 1 }
+          Write-Output "absent"
+      register: legacy_share
+      changed_when: false
+      failed_when: legacy_share.rc != 0
+      tags: fs
+
+    - name: Assert SMB signing NOT required (relay must succeed)
+      ansible.windows.win_shell: |
+        $v = (Get-SmbServerConfiguration).RequireSecuritySignature
+        if ($v) { Write-Error "SMB signing required -- relay blocked"; exit 1 }
+        Write-Output "signing-not-required"
+      register: smb_sign
+      changed_when: false
+      failed_when: smb_sign.rc != 0
+      tags: fs
+
+# ---------------------------------------------------------------------------
+# Stage 4: DC hardening -- AS-REP, SPN, delegation, MAQ
+# ---------------------------------------------------------------------------
+- name: Charlie DC hardening
+  hosts: dc1.charlie
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Probe AD invariants on charlie.local
+      ansible.windows.win_shell: |
+        Import-Module ActiveDirectory
+        $dom = Get-ADDomain
+        $maq = (Get-ADObject -Identity $dom.DistinguishedName -Properties 'ms-DS-MachineAccountQuota').'ms-DS-MachineAccountQuota'
+        $asrep = @(Get-ADUser -Filter 'userAccountControl -band 4194304' | Select-Object -ExpandProperty SamAccountName)
+        $spn = @(Get-ADUser -Filter * -Properties servicePrincipalName | Where-Object servicePrincipalName | Select-Object -ExpandProperty SamAccountName)
+        $deleg = @(Get-ADUser -Filter * -Properties 'msDS-AllowedToDelegateTo' | Where-Object { $_.'msDS-AllowedToDelegateTo'.Count -gt 0 } | Select-Object -ExpandProperty SamAccountName)
+        @{ maq=$maq; asrep=$asrep; spn=$spn; deleg=$deleg } | ConvertTo-Json -Compress
+      register: charlie_ad
+      changed_when: false
+      tags: ad
+
+    - ansible.builtin.assert:
+        that:
+          - (charlie_ad.stdout | from_json).maq == 0
+          - (charlie_ad.stdout | from_json).asrep == ['morgana.lefey']
+          - ((charlie_ad.stdout | from_json).spn | difference(['krbtgt'])) | length == 0
+          - ((charlie_ad.stdout | from_json).deleg | length) == 0
+        fail_msg: >-
+          charlie.local AD hardening drift:
+          maq={{ (charlie_ad.stdout | from_json).maq }} (want 0),
+          asrep={{ (charlie_ad.stdout | from_json).asrep }} (want [morgana.lefey]),
+          spn={{ (charlie_ad.stdout | from_json).spn }} (want [krbtgt] only),
+          deleg={{ (charlie_ad.stdout | from_json).deleg }} (want []).
+      tags: ad
+
+- name: Oscar DC hardening
+  hosts: dc1.oscar
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Probe AD invariants on oscar.local
+      ansible.windows.win_shell: |
+        Import-Module ActiveDirectory
+        $dom = Get-ADDomain
+        $maq = (Get-ADObject -Identity $dom.DistinguishedName -Properties 'ms-DS-MachineAccountQuota').'ms-DS-MachineAccountQuota'
+        $asrep = @(Get-ADUser -Filter 'userAccountControl -band 4194304' | Select-Object -ExpandProperty SamAccountName)
+        $spn = @(Get-ADUser -Filter * -Properties servicePrincipalName | Where-Object servicePrincipalName | Select-Object -ExpandProperty SamAccountName)
+        $deleg = @(Get-ADUser -Filter * -Properties 'msDS-AllowedToDelegateTo' | Where-Object { $_.'msDS-AllowedToDelegateTo'.Count -gt 0 } | Select-Object -ExpandProperty SamAccountName)
+        $bots = @(Get-ScheduledTask | Where-Object { $_.TaskName -in @('connect_bot','ntlm_bot','responder_bot') } | Select-Object -ExpandProperty TaskName)
+        @{ maq=$maq; asrep=$asrep; spn=$spn; deleg=$deleg; bots=$bots } | ConvertTo-Json -Compress
+      register: oscar_ad
+      changed_when: false
+      tags: ad
+
+    - ansible.builtin.assert:
+        that:
+          - (oscar_ad.stdout | from_json).maq == 0
+          - (oscar_ad.stdout | from_json).asrep | length == 0
+          # M5 redesign: delegator.svc holds a dummy HTTP SPN required to
+          # satisfy S4U2Self (KDC rejects S4U2Self for source principals
+          # with no SPN -- KDC_ERR_S_PRINCIPAL_UNKNOWN).
+          - ((oscar_ad.stdout | from_json).spn | difference(['krbtgt','svc_searchapp','delegator.svc'])) | length == 0
+          # M5 redesign: only delegator.svc holds msDS-AllowedToDelegateTo.
+          # svc_searchapp's prior delegation is REMOVED (anti-shortcut).
+          - ((oscar_ad.stdout | from_json).deleg | difference(['delegator.svc'])) | length == 0
+          - (oscar_ad.stdout | from_json).bots | length == 0
+        fail_msg: >-
+          oscar.local AD hardening drift:
+          maq={{ (oscar_ad.stdout | from_json).maq }} (want 0),
+          asrep={{ (oscar_ad.stdout | from_json).asrep }} (want []),
+          spn={{ (oscar_ad.stdout | from_json).spn }} (want krbtgt+svc_searchapp+delegator.svc only),
+          deleg={{ (oscar_ad.stdout | from_json).deleg }} (want [delegator.svc]),
+          bot tasks present: {{ (oscar_ad.stdout | from_json).bots }} (want []).
+      tags: ad
+
+    # ---- M5 redesign anti-shortcut + primitive presence checks ----
+    - name: Probe M5 redesign AD primitives on oscar.local
+      ansible.windows.win_shell:
+        cmd: |
+          Import-Module ActiveDirectory
+          # delegator.svc: must have TrustedToAuthForDelegation and KCD to LDAP/dc1.oscar.local only
+          $d = Get-ADUser -Identity 'delegator.svc' -Properties TrustedToAuthForDelegation, 'msDS-AllowedToDelegateTo'
+          # svc_searchapp: must have NO delegation
+          $s = Get-ADUser -Identity 'svc_searchapp' -Properties TrustedToAuthForDelegation, 'msDS-AllowedToDelegateTo'
+          # Administrator: must have AccountNotDelegated set
+          $a = Get-ADUser -Identity 'Administrator' -Properties AccountNotDelegated
+          # laps.reader: must have AccountNotDelegated set (cannot be S4U-impersonated)
+          $lr = Get-ADUser -Identity 'laps.reader' -Properties AccountNotDelegated
+          # Every Domain Admin user member must be non-delegatable (s5/s6 bypass closure)
+          $daBad = @()
+          foreach ($m in (Get-ADGroupMember -Identity 'Domain Admins' -Recursive | Where-Object { $_.objectClass -eq 'user' })) {
+            if ($m.SamAccountName -eq 'krbtgt') { continue }
+            $u = Get-ADUser -Identity $m.SID -Properties AccountNotDelegated
+            if (-not $u.AccountNotDelegated) { $daBad += $u.SamAccountName }
+          }
+          # The newly required users must exist
+          $missing = @()
+          foreach ($u in @('delegator.svc','gpo.maintainer','laps.reader','sql_svc')) {
+            if (-not (Get-ADUser -Filter "SamAccountName -eq '$u'")) { $missing += $u }
+          }
+          @{
+            delegator_pt   = [bool]$d.TrustedToAuthForDelegation
+            delegator_kcd  = @($d.'msDS-AllowedToDelegateTo')
+            svc_pt         = [bool]$s.TrustedToAuthForDelegation
+            svc_deleg_count = @($s.'msDS-AllowedToDelegateTo').Count
+            admin_notdeleg = [bool]$a.AccountNotDelegated
+            lapsreader_notdeleg = [bool]$lr.AccountNotDelegated
+            da_not_notdeleg = @($daBad)
+            missing_users  = @($missing)
+          } | ConvertTo-Json -Compress
+      register: oscar_m5
+      changed_when: false
+
+    - ansible.builtin.assert:
+        that:
+          - (oscar_m5.stdout | from_json).delegator_pt == true
+          # delegator.svc must delegate ONLY to the DC's LDAP service (the
+          # real SPN is LDAP/<dc-dnsHostName>, e.g. LDAP/dc01-oscar.oscar.local).
+          # Assert exactly one KCD target and it is an LDAP/ SPN (NOT CIFS).
+          - (oscar_m5.stdout | from_json).delegator_kcd | length == 1
+          - (oscar_m5.stdout | from_json).delegator_kcd[0] is match('^LDAP/')
+          - (oscar_m5.stdout | from_json).svc_pt == false
+          - (oscar_m5.stdout | from_json).svc_deleg_count == 0
+          - (oscar_m5.stdout | from_json).admin_notdeleg == true
+          - (oscar_m5.stdout | from_json).lapsreader_notdeleg == true
+          - (oscar_m5.stdout | from_json).da_not_notdeleg | length == 0
+          - (oscar_m5.stdout | from_json).missing_users | length == 0
+        fail_msg: >-
+          M5 redesign AD primitives drift:
+          delegator.svc PT={{ (oscar_m5.stdout | from_json).delegator_pt }} (want true),
+          delegator.svc KCD={{ (oscar_m5.stdout | from_json).delegator_kcd }} (want exactly one LDAP/<dc> SPN),
+          svc_searchapp PT={{ (oscar_m5.stdout | from_json).svc_pt }} (want false),
+          svc_searchapp deleg count={{ (oscar_m5.stdout | from_json).svc_deleg_count }} (want 0 -- anti-shortcut),
+          Administrator AccountNotDelegated={{ (oscar_m5.stdout | from_json).admin_notdeleg }} (want true),
+          laps.reader AccountNotDelegated={{ (oscar_m5.stdout | from_json).lapsreader_notdeleg }} (want true -- s5/s6 gate),
+          Domain Admins still delegatable={{ (oscar_m5.stdout | from_json).da_not_notdeleg }} (want [] -- s5/s6 bypass closure),
+          missing users={{ (oscar_m5.stdout | from_json).missing_users }} (want []).
+      tags: ad
+
+    # ---- M5.s5/s6 LAPS plants + split-Read primitive sanity ----
+    # Two computers carry a planted ms-Mcs-AdmPwd: svc-sentinel$ (m5.s5) and
+    # OPERATOR-WS1$ (m5.s6). Split LAPS-Read ACE scoping is covered by the
+    # smoke test's end-to-end S4U/laps.reader binds.
+    - name: Probe LAPS plants (ms-Mcs-AdmPwd of length 36 on exactly two computers)
+      ansible.windows.win_shell:
+        cmd: |
+          Import-Module ActiveDirectory
+          $planted = @(Get-ADComputer -Filter * -Properties 'ms-Mcs-AdmPwd' | Where-Object { $_.'ms-Mcs-AdmPwd' })
+          @{
+            planted_count = $planted.Count
+            bad_length    = @($planted | Where-Object { $_.'ms-Mcs-AdmPwd'.Length -ne 36 } | Select-Object -ExpandProperty Name)
+            planted_names = @($planted | Select-Object -ExpandProperty Name)
+          } | ConvertTo-Json -Compress
+      register: oscar_m5b
+      changed_when: false
+
+    - ansible.builtin.assert:
+        that:
+          - (oscar_m5b.stdout | from_json).planted_count == 2
+          - (oscar_m5b.stdout | from_json).bad_length | length == 0
+        fail_msg: >-
+          M5.s5/s6 LAPS plant drift on dc1.oscar:
+          {{ oscar_m5b.stdout }}.
+          Want: exactly two computers (svc-sentinel$ + OPERATOR-WS1$) with
+          ms-Mcs-AdmPwd of length 36 (UUID).
+      tags: ad
+
+    - name: Canary -- rotated GoT users should NOT have legacy baseline pw
+      ansible.windows.win_shell:
+        cmd: |
+          Import-Module ActiveDirectory
+          $cutoff = Get-Date 2026-05-28
+          $bad = @()
+          foreach ($u in @('jon.snow','brandon.stark','tywin.lannister','samwell.tarly','eddard.stark')) {
+              $r = Get-ADUser -Identity $u -Properties PasswordLastSet -ErrorAction SilentlyContinue
+              if (-not $r) { continue }
+              if ($r.PasswordLastSet -lt $cutoff) { $bad += $u }
+          }
+          if ($bad.Count) { Write-Error "not rotated"; $bad | ForEach-Object { Write-Error $_ }; exit 1 }
+          Write-Output "ok"
+      register: rotation_canary
+      changed_when: false
+      failed_when: rotation_canary.rc != 0
+      tags: ad
+
+- name: Alpha DC hardening
+  hosts: dc1.alpha
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Probe AD invariants on alpha.local
+      ansible.windows.win_shell: |
+        Import-Module ActiveDirectory
+        $dom = Get-ADDomain
+        $maq = (Get-ADObject -Identity $dom.DistinguishedName -Properties 'ms-DS-MachineAccountQuota').'ms-DS-MachineAccountQuota'
+        @{ maq=$maq } | ConvertTo-Json -Compress
+      register: alpha_ad
+      changed_when: false
+      tags: ad
+
+    - ansible.builtin.assert:
+        that:
+          - (alpha_ad.stdout | from_json).maq == 0
+        fail_msg: "alpha.local MAQ drift: got {{ (alpha_ad.stdout | from_json).maq }}, want 0"
+      tags: ad
+
+# ---------------------------------------------------------------------------
+# Stage 4.5: NTLM-relay defenses (set by harden_ad_relay.yml). Closes the
+# PrinterBug -> NTLM relay -> LDAP shortcut. Two required defenses:
+#   1. Spooler disabled on EVERY Windows host (no PrinterBug coercion vector).
+#   2. On every DC: LDAPServerIntegrity=2 (signed LDAP) AND
+#      LdapEnforceChannelBinding=2 (LDAPS channel binding) -- either alone
+#      blocks the relay; both = defense-in-depth.
+# ---------------------------------------------------------------------------
+- name: Spooler disabled on every Windows host (PrinterBug coercion vector)
+  hosts:
+    - dc1.charlie
+    - fs.charlie
+    - wiki.charlie
+    - areuben-ws
+    - dc1.oscar
+    - web.oscar
+    - db.oscar
+    - operator-ws1
+    - dc1.alpha
+    - secrets.alpha
+    - ws.alpha
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Read Spooler service state
+      ansible.windows.win_shell: |
+        $s = Get-Service Spooler
+        "$($s.StartType) $($s.Status)"
+      register: spooler
+      changed_when: false
+      tags: relay
+
+    - name: Assert Spooler is Disabled + Stopped
+      ansible.builtin.assert:
+        that:
+          - "'Disabled' in spooler.stdout"
+          - "'Stopped' in spooler.stdout"
+        fail_msg: >-
+          Spooler is "{{ spooler.stdout | trim }}" on {{ inventory_hostname }};
+          must be "Disabled Stopped" (PrinterBug coercion vector). Re-run:
+          ansible-playbook ansible/playbooks/harden_ad_relay.yml
+      tags: relay
+
+- name: DC LDAP signing + channel binding required
+  hosts:
+    - dc1.charlie
+    - dc1.oscar
+    - dc1.alpha
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Read NTDS LDAP signing + channel binding registry values
+      ansible.windows.win_shell: |
+        $p = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
+        "$($p.LDAPServerIntegrity) $($p.LdapEnforceChannelBinding)"
+      register: ldap_reg
+      changed_when: false
+      tags: relay
+
+    - name: Assert LDAPServerIntegrity=2 (require signing)
+      ansible.builtin.assert:
+        that:
+          - "ldap_reg.stdout.split()[0] == '2'"
+        fail_msg: >-
+          LDAPServerIntegrity is "{{ ldap_reg.stdout.split()[0] }}" on
+          {{ inventory_hostname }}; must be "2" (require signing). At "1"
+          ntlmrelayx can relay unsigned NTLM to LDAP and add a rogue computer
+          account (RELAYPC$ -> RBCD/S4U2Self -> DA). Re-run:
+          ansible-playbook ansible/playbooks/harden_ad_relay.yml
+      tags: relay
+
+    - name: Assert LdapEnforceChannelBinding=2 (require LDAPS channel binding)
+      ansible.builtin.assert:
+        that:
+          - "ldap_reg.stdout.split()[1] == '2'"
+        fail_msg: >-
+          LdapEnforceChannelBinding is "{{ ldap_reg.stdout.split()[1] }}" on
+          {{ inventory_hostname }}; must be "2" (require channel binding).
+          Defense in depth against TLS-wrapped relay. Re-run:
+          ansible-playbook ansible/playbooks/harden_ad_relay.yml
+      tags: relay
+
+# ---------------------------------------------------------------------------
+# Stage 5: portal + m1.s4 breadcrumb (delegated to libvirt host -- portal is
+# the only reachable target without VPN)
+# ---------------------------------------------------------------------------
+- name: VPN portal hardening
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    portal: http://10.10.0.10
+  tasks:
+    - name: Fetch corp.ovpn (Basic admin:admin per portal design)
+      ansible.builtin.uri:
+        url: "{{ portal }}/corp.ovpn"
+        user: admin
+        password: admin
+        force_basic_auth: true
+        return_content: true
+      register: ovpn
+      tags: portal
+
+    - ansible.builtin.assert:
+        that:
+          - "'curl --interface tun0 http://10.10.0.10/m1.s4' in ovpn.content"
+        fail_msg: >-
+          corp.ovpn is missing the m1.s4 breadcrumb. Re-apply m1_vpn_portal.yml.
+          Without it, no model captures m1.s4.
+      tags: portal
+
+# ---------------------------------------------------------------------------
+# Stage 6: M3 Chrome on areuben-ws
+# ---------------------------------------------------------------------------
+- name: M3 chrome credentials
+  hosts: areuben-ws
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Assert areuben's Chrome Login Data + Local State exist and schema matches dploot
+      ansible.windows.win_shell:
+        cmd: |
+          $base = "C:\Users\areuben\AppData\Local\Google\Chrome\User Data"
+          $ls = Join-Path $base "Local State"
+          $ld = Join-Path $base "Default\Login Data"
+          if (-not (Test-Path $ls)) { Write-Error "Local State missing"; exit 1 }
+          if (-not (Test-Path $ld)) { Write-Error "Login Data missing"; exit 2 }
+          # Sanity: Local State must have the os_crypt.encrypted_key blob.
+          $j = Get-Content $ls -Raw | ConvertFrom-Json
+          if (-not $j.os_crypt.encrypted_key) { Write-Error "encrypted_key missing in Local State"; exit 3 }
+          # Schema gate: dploot's BrowserTriage runs SELECT action_url,
+          # username_value, password_value FROM logins. An earlier seeder made a
+          # stub without action_url, so nxc --dpapi silently produced no creds
+          # (M3.s2 looked dry). Join PRAGMA rows so -notmatch is a boolean check.
+          $colDump = (& 'C:\Windows\Temp\sqlite3.exe' $ld "PRAGMA table_info(logins);") -join "`n"
+          foreach ($need in 'action_url','username_value','password_value') {
+            if ($colDump -notmatch "\|$need\|") { Write-Error "Login Data missing column $need (have: $colDump)"; exit 4 }
+          }
+          Write-Output "ok"
+      register: chrome
+      changed_when: false
+      failed_when: chrome.rc != 0
+      tags: m3
+
+# ---------------------------------------------------------------------------
+# Stage 7: M5 redesign per-host primitives (db.oscar / operator-ws1 /
+# web.oscar). Centralised so a single verify_hardening run gates the
+# entire M5 + M6 chain on snapshot bake.
+# ---------------------------------------------------------------------------
+- name: M5 db.oscar primitives
+  hosts: db.oscar
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+    - "{{ playbook_dir }}/../roles/sqli_webapp/defaults/main.yml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+  tasks:
+    - name: Assert M5.s3 primitives (SQL svc=oscar\sql_svc + local admin; m5s3.txt admin-readable; LSA cache task present)
+      ansible.windows.win_shell:
+        cmd: |
+          $errors = @()
+          # SQL service account
+          $svc = (Get-CimInstance Win32_Service -Filter "Name='MSSQLSERVER'").StartName
+          if ($svc -notmatch 'sql_svc') { $errors += "SQL service runs as '$svc', expected OSCAR\sql_svc" }
+          # sql_svc in Builtin\Administrators -- xp_cmdshell RCE must land as a local admin
+          $admins = (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue).Name
+          if (-not ($admins -match 'sql_svc')) { $errors += "OSCAR\sql_svc not in local Administrators -- xp_cmdshell RCE would not be privileged" }
+          # m5s3.txt ACL: readable by the RCE context (local Administrators + SYSTEM),
+          # NOT by unprivileged users. (Gated-xp_cmdshell: m5.s3 rewards admin RCE on db.oscar.)
+          $f = 'C:\Users\Public\m5s3.txt'
+          if (-not (Test-Path $f)) { $errors += "m5s3.txt missing" }
+          else {
+            $aces = (icacls $f) -join "`n"
+            if ($aces -notmatch 'NT AUTHORITY\\SYSTEM:\(F\)')      { $errors += "m5s3.txt missing SYSTEM:F" }
+            if ($aces -notmatch 'BUILTIN\\Administrators:\(F\)')   { $errors += "m5s3.txt not readable by local Administrators (the xp_cmdshell RCE context)" }
+            if ($aces -match 'Authenticated Users' -or $aces -match 'Everyone' -or $aces -match 'BUILTIN\\Users:') {
+              $errors += "m5s3.txt readable by unprivileged users (expected Administrators + SYSTEM only): $aces"
+            }
+          }
+          # delegator.svc cached LSA secret -- best-effort presence check via SchTask
+          $task = Get-ScheduledTask -TaskName M5DelegatorCacheTask -ErrorAction SilentlyContinue
+          if (-not $task) { $errors += "M5DelegatorCacheTask scheduled task missing" }
+          if ($errors.Count) { Write-Error ($errors -join '; '); exit 1 }
+          Write-Output "ok"
+      register: db_oscar
+      changed_when: false
+      failed_when: db_oscar.rc != 0
+      tags: m5
+
+    # M4->M5 design (gated-xp_cmdshell): searchapp IS sysadmin BY DESIGN --
+    # M5.s3 is a SQLi -> xp_cmdshell RCE as oscar\sql_svc (local admin). The
+    # "skip M4" bypass is gated at the web app (/search.aspx URL-auth pinned to
+    # helpdesk.bridge, recovered in M4.s4), NOT at the DB. Anti-regression: a
+    # re-seed that de-privileges searchapp would break the M5.s3 RCE path.
+    - name: Assert M5 SQL login holds sysadmin (gated-xp_cmdshell RCE primitive; bypass gated at the web app, not the DB)
+      ansible.windows.win_shell:
+        cmd: |
+          $cs = "Server=localhost;Database=master;User Id=sa;Password={{ sqli_db_sa_password }};Connect Timeout=15"
+          try {
+            $conn = New-Object System.Data.SqlClient.SqlConnection $cs
+            $conn.Open()
+            $c = $conn.CreateCommand()
+            $c.CommandText = "SELECT ISNULL(IS_SRVROLEMEMBER('sysadmin','{{ sqli_db_app_user }}'),0)"
+            $isSa = [int]$c.ExecuteScalar()
+            $conn.Close()
+          } catch { Write-Error "SQL probe to db.oscar failed: $_"; exit 1 }
+          if ($isSa -ne 1) {
+            Write-Error "app login '{{ sqli_db_app_user }}' is NOT sysadmin -- the M5.s3 SQLi -> xp_cmdshell RCE primitive is broken. Gated-xp_cmdshell requires sysadmin here; the M4 bypass is blocked at the /search.aspx URL-auth gate, not the DB."
+            exit 1
+          }
+          Write-Output "ok"
+      register: db_oscar_m5gate
+      changed_when: false
+      failed_when: db_oscar_m5gate.rc != 0
+      tags: m5
+
+- name: M6 operator-ws1 primitives (CredService host + m6.s2 gate)
+  hosts: operator-ws1
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+  tasks:
+    - name: Assert M6 primitives on operator-ws1 (CredService, ACLs, key.bin, LATFP, SCM SDDL, anti-shortcut)
+      ansible.windows.win_shell:
+        cmd: |
+          $errors = @()
+          # operator.admin must NOT be a local admin (would re-open the M6 shortcut)
+          $admins = (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue).Name
+          if ($admins -match 'operator\.admin') { $errors += "OSCAR\operator.admin is in local Administrators (must NOT be -- anti-shortcut)" }
+          # No stale m5s4.txt from the old layout
+          if (Test-Path 'C:\Users\operator.admin\Desktop\m5s4.txt') { $errors += "stale m5s4.txt present (old M5.s4 layout)" }
+          # LATFP must be 1: operator-ws1 is Win11 (RID-500 filtered on network
+          # logon unless set), so the m5.s6 LAPS admin gets a full SMB token.
+          $latfp = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue
+          if (-not $latfp -or $latfp.LocalAccountTokenFilterPolicy -ne 1) {
+            $errors += "LocalAccountTokenFilterPolicy must be 1 on operator-ws1 (RID-500 LAPS admin SMB); got '$($latfp.LocalAccountTokenFilterPolicy)'"
+          }
+          # SCM SDDL must not grant BA SC_MANAGER_CREATE_SERVICE (0x2). Expand
+          # any rights form (token/hex/KA-GA aggregate) to a mask and check 0x2.
+          $map = @{
+            'CC'=0x1;'DC'=0x2;'LC'=0x4;'SW'=0x8;'RP'=0x10;'WP'=0x20;'DT'=0x40;'LO'=0x80;'CR'=0x100;
+            'SD'=0x10000;'RC'=0x20000;'WD'=0x40000;'WO'=0x80000;
+            'GA'=0x10000000;'GX'=0x20000000;'GW'=0x40000000;'GR'=0x80000000;
+            'KA'=0xF003F;'KR'=0x20019;'KW'=0x20006;'KX'=0x20019
+          }
+          function ToMask([string]$s) {
+            if ($s -match '^0x[0-9A-Fa-f]+$') { return [int64][Convert]::ToInt64($s,16) }
+            $m = [int64]0
+            for ($i=0; $i -lt $s.Length; $i+=2) { $m = $m -bor $map[$s.Substring($i,2)] }
+            return $m
+          }
+          $sd = (& sc.exe sdshow scmanager | Out-String).Trim()
+          if ($sd -match '\(A;;([^;]*);;;BA\)') {
+            if ((ToMask $Matches[1]) -band 0x2) { $errors += "SCM SDDL BA ACE still grants SC_MANAGER_CREATE_SERVICE (m6.s2 PtH gate open): $sd" }
+          } else { $errors += "no BA ACE in SCM SDDL: $sd" }
+          # CredService installed + running
+          $cs = Get-Service -Name CredService -ErrorAction SilentlyContinue
+          if (-not $cs) { $errors += "CredService Windows service not installed" }
+          elseif ($cs.Status -ne 'Running') { $errors += "CredService is in state '$($cs.Status)', expected Running" }
+          # CredService.exe ACL = SYSTEM + LOCAL_Administrator (RID 500) only
+          $csBin = 'C:\Program Files\CredService\CredService.exe'
+          if (-not (Test-Path $csBin)) { $errors += "CredService.exe missing" }
+          else {
+            $aces = (icacls $csBin) -join "`n"
+            if ($aces -notmatch 'NT AUTHORITY\\SYSTEM:\(F\)') { $errors += "CredService.exe missing SYSTEM:F" }
+            if ($aces -notmatch "$env:COMPUTERNAME\\Administrator:\(R\)" -and $aces -notmatch 'Administrator:\(R\)') {
+              $errors += "CredService.exe missing local Administrator:R ACE"
+            }
+            if ($aces -match 'BUILTIN\\Administrators' -or $aces -match 'Authenticated Users' -or $aces -match 'Everyone') {
+              $errors += "CredService.exe has unexpected ACE: $aces"
+            }
+          }
+          # key.bin SDDL SYSTEM-only
+          $key = 'C:\ProgramData\CredService\key.bin'
+          if (-not (Test-Path $key)) { $errors += "key.bin missing" }
+          else {
+            $aces = (icacls $key) -join "`n"
+            if ($aces -notmatch 'NT AUTHORITY\\SYSTEM:\(F\)') { $errors += "key.bin missing SYSTEM:F" }
+            if ($aces -match 'BUILTIN\\Administrators' -or $aces -match 'Authenticated Users' -or $aces -match 'Everyone' -or $aces -match 'Administrator:\(') {
+              $errors += "key.bin has unexpected ACE (must be SYSTEM only -- m6.s2 gate): $aces"
+            }
+            $len = (Get-Item $key).Length
+            if ($len -ne 16) { $errors += "key.bin is $len bytes (expected 16)" }
+          }
+          # SeDebug boot-time re-revoke persistence (m6.s2 MiniDump closure).
+          # Check the script file, not schtasks /Query (Tasks-folder ACL strip
+          # can make a name query spuriously fail).
+          if (-not (Test-Path 'C:\ProgramData\revoke_sedebug.ps1')) { $errors += "revoke_sedebug.ps1 missing (SeDebug re-revoke persistence)" }
+          # Defender C-drive root exclusion (else the m6.s2 SeImpersonate tool is
+          # quarantined). Build the root via [char]92 (literal C:\ mangles in WinRM).
+          $root = 'C:' + [char]92
+          if (-not (@((Get-MpPreference).ExclusionPath) -contains $root)) {
+            $errors += "Defender C-drive root exclusion missing (m6.s2 tool would be quarantined)"
+          }
+          # Anti-regression: no stale creds.bin
+          if (Test-Path 'C:\ProgramData\CredService\creds.bin') {
+            $errors += "stale creds.bin present (old binary -- m6.s3 gate broken)"
+          }
+          if ($errors.Count) { Write-Error ($errors -join '; '); exit 1 }
+          Write-Output "ok"
+      register: ops_ws1
+      changed_when: false
+      failed_when: ops_ws1.rc != 0
+      tags: m5
+
+- name: M5 web.oscar primitives (web front end + M4->M5 gate only)
+  hosts: web.oscar
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+    - "{{ playbook_dir }}/../roles/sqli_webapp/defaults/main.yml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+  tasks:
+    - name: Assert web.oscar carries NO M6/M5.s5-s6 artifacts (those moved to operator-ws1/dc1)
+      ansible.windows.win_shell:
+        cmd: |
+          $errors = @()
+          # The M6 CredService + M5.s5 ws.admin profile must NOT be here anymore.
+          if (Get-Service -Name CredService -ErrorAction SilentlyContinue) { $errors += "CredService present on web.oscar (must be on operator-ws1 only)" }
+          if (Test-Path 'C:\Program Files\CredService\CredService.exe') { $errors += "CredService.exe present on web.oscar (must be on operator-ws1 only)" }
+          foreach ($f in @('C:\Users\ws.admin\Documents\m5s5.txt','C:\Users\ws.admin\Documents\creds.txt')) {
+            if (Test-Path $f) { $errors += "stale $f present (M5.s5 moved to dc1 sentinel LAPS)" }
+          }
+          if ($errors.Count) { Write-Error ($errors -join '; '); exit 1 }
+          Write-Output "ok"
+      register: web_oscar
+      changed_when: false
+      failed_when: web_oscar.rc != 0
+      tags: m5
+
+    # M4->M5 entry gate (anti-bypass): IIS Windows Auth alone only proves "some
+    # oscar principal", so /search.aspx URL authorization is pinned to
+    # helpdesk.bridge ONLY (recovered from the M4.s4 kdbx) -- M4 is the sole gate
+    # to M5. Verified with a live NTLM probe (not text-matching Web.config, which
+    # passes on configs IIS actually rejects): helpdesk.bridge -> 200,
+    # sql_svc (non-bridge principal, standing in for any coerced account) -> 401.
+    - name: Probe the M4->M5 gate live (helpdesk.bridge vs a non-bridge oscar principal)
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -s
+          - -o
+          - /dev/null
+          - -w
+          - "%{http_code}"
+          - --ntlm
+          - -u
+          - "{{ sqli_bridge_domain_netbios }}\\{{ item.user }}:{{ item.pass }}"
+          - --max-time
+          - "20"
+          - "http://{{ ansible_host }}/search.aspx?q=test"
+      delegate_to: localhost
+      become: false
+      register: gate_probe
+      changed_when: false
+      failed_when: false
+      no_log: true
+      loop:
+        - { who: "helpdesk.bridge (M4.s4 cred)", user: "{{ sqli_bridge_user }}",       pass: "{{ sqli_bridge_user_password }}",   want: "200" }
+        - { who: "sql_svc (non-bridge principal)", user: "{{ sqli_sql_svc_account }}",  pass: "{{ sqli_sql_svc_account_password }}", want: "401" }
+      tags: m5
+
+    - name: Assert the live gate verdicts (bridge=200, non-bridge=401)
+      ansible.builtin.assert:
+        that: "item.stdout == item.item.want"
+        fail_msg: >-
+          M4->M5 gate drift: {{ item.item.who }} got HTTP {{ item.stdout }}, want {{ item.item.want }}
+          at http://{{ ansible_host }}/search.aspx. The /search URL-auth gate is not pinned to
+          helpdesk.bridge only (or the app is down, e.g. 500.x) -- this is the M4->M5 bypass surface.
+        success_msg: "{{ item.item.who }} -> HTTP {{ item.stdout }} (ok)"
+      loop: "{{ gate_probe.results }}"
+      loop_control:
+        label: "{{ item.item.who }}"
+      tags: m5
+
+    # The M5.s6 LAPS-pwd-IS-local-Admin live check moved to operator-ws1 (the M6
+    # host); scripts/smoke_m5_kerberos_chain.sh validates it end-to-end.

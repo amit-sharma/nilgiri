@@ -1,0 +1,9 @@
+---
+# cicd_runner (M7) -- lightweight "TeamCity" REST stub on teamcity.alpha
+# (alpha 10.40.0.21). Validates the bearer token leaked in ws.alpha's PS
+# history (M7.s4) so that credential is real. (The gitlab-runner that runs the
+# M7.s5 pipeline is in the gitlab_cicd role, on gitlab.alpha.)
+
+cicd_teamcity_port: 8111
+# Must match alpha_pivot_host's alpha_teamcity_token (leaked in PS history).
+cicd_teamcity_token: 'tcs-nilgiri7s4-cibuildtoken'

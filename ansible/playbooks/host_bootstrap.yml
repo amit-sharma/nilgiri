@@ -1,0 +1,108 @@
+---
+# One-time host-side setup on the libvirt host (localhost). Default invocation
+# does the safe setup (libguestfs + swtpm + iptables forward wiring); the
+# destructive lease-state sweep is opt-in via --tags leases.
+#     make host-bootstrap       # libguestfs + swtpm + iptables
+#     make host-clear-leases    # only the dnsmasq lease sweep
+
+- hosts: libvirt_host
+  become: true
+  gather_facts: true
+  vars:
+    attacker_subnet: "10.99.0.0/24"
+    dmz_subnet:      "10.10.0.0/24"
+    libvirt_dnsmasq_dir: /var/lib/libvirt/dnsmasq
+
+  tasks:
+    # libguestfs: make /boot/vmlinuz-* world-readable so virt-customize can
+    # build its supermin appliance as non-root. Persistent via dpkg-statoverride.
+    - name: Discover kernel images
+      ansible.builtin.find:
+        paths: /boot
+        patterns: "vmlinuz-*"
+        file_type: file
+      register: vmlinuz_files
+      tags: libguestfs
+
+    - name: Make /boot/vmlinuz-* world-readable (persistent via dpkg-statoverride)
+      ansible.builtin.shell: |
+        set -e
+        if dpkg-statoverride --list "{{ item.path }}" >/dev/null 2>&1; then
+            current="$(dpkg-statoverride --list "{{ item.path }}" | awk '{print $3}')"
+            if [ "$current" = "0644" ]; then echo "noop"; exit 0; fi
+            dpkg-statoverride --remove "{{ item.path }}"
+        fi
+        dpkg-statoverride --update --add root root 0644 "{{ item.path }}"
+        echo "changed"
+      args:
+        executable: /bin/bash
+      register: statoverride
+      changed_when: "'changed' in statoverride.stdout"
+      loop: "{{ vmlinuz_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      tags: libguestfs
+
+    # swtpm: software TPM 2.0 emulator, required for the Win11 base-image
+    # Packer build (Win11 22H2+ refuses install without TPM 2.0 + Secure Boot).
+    - name: Install swtpm (Windows 11 base-image build prerequisite)
+      ansible.builtin.apt:
+        name:
+          - swtpm
+          - swtpm-tools
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      tags: swtpm
+
+    # iptables FORWARD: allow attacker <-> dmz so kali can reach the vpn-portal
+    # (M1 entry), past libvirt's default cross-network REJECT. charlie and oscar
+    # stay isolated from the attacker net -- the M1->M2 pivot rides the OpenVPN
+    # tunnel kali establishes, not this host rule.
+    - name: Allow attacker -> dmz (kali -> vpn-portal)
+      ansible.builtin.iptables:
+        chain: FORWARD
+        source: "{{ attacker_subnet }}"
+        destination: "{{ dmz_subnet }}"
+        jump: ACCEPT
+        action: insert
+        comment: "nilgiri: kali -> dmz portal"
+      tags: iptables
+
+    - name: Allow dmz -> attacker (reply path)
+      ansible.builtin.iptables:
+        chain: FORWARD
+        source: "{{ dmz_subnet }}"
+        destination: "{{ attacker_subnet }}"
+        jump: ACCEPT
+        action: insert
+        comment: "nilgiri: vpn-portal -> kali (reply)"
+      tags: iptables
+
+    # (opt-in via --tags leases) Wipe stale dnsmasq lease state for the
+    # nilgiri-* libvirt networks, where an old MAC's lease can shadow a fresh
+    # DHCP host reservation. Running VMs drop their link briefly.
+    - name: Enumerate nilgiri-* networks
+      ansible.builtin.command: virsh net-list --all --name
+      register: virsh_nets
+      changed_when: false
+      tags:
+        - never
+        - leases
+
+    - name: Stop, wipe lease state, restart each nilgiri network
+      ansible.builtin.shell: |
+        set -e
+        bridge="$(virsh net-info '{{ item }}' 2>/dev/null | awk '/^Bridge:/ {print $2}')"
+        virsh net-destroy '{{ item }}' 2>/dev/null || true
+        if [ -n "$bridge" ]; then
+            rm -f "{{ libvirt_dnsmasq_dir }}/${bridge}.status" \
+                  "{{ libvirt_dnsmasq_dir }}/${bridge}.macs"
+        fi
+        virsh net-start '{{ item }}'
+      args:
+        executable: /bin/bash
+      loop: "{{ virsh_nets.stdout_lines | select('match', '^nilgiri-') | list }}"
+      tags:
+        - never
+        - leases

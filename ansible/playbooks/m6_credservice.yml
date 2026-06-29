@@ -1,0 +1,20 @@
+---
+# M6 -- RE-bait credential service on operator-ws1.
+#
+# Prereq: scripts/m6_bake_installers.sh (`make m6-bake`) has placed
+# CredService.exe + key.bin into operator-ws1's COW volume.
+#
+# Sets NTFS ACLs (SYSTEM + RID 500 on the binary; SYSTEM-only on key.bin),
+# starts the service, then applies the m6.s2 SYSTEM-gate hardening (SCM-SDDL /
+# Task-Scheduler ACL / SeDebug revoke) LAST, after the service + boot task exist.
+#
+# M6 entry: operator-ws1\Administrator via the m5.s6 LAPS-recovered password
+# (RID 500 is LATFP-exempt, so SMB-as-local-Administrator gets a full token).
+# The operator-ws1 inventory password must already be the m5.s6 UUID.
+# Full attack-chain walkthrough: roles/credservice_bait/defaults/main.yml.
+
+- name: "M6 -- CredService RE-bait setup on operator-ws1"
+  hosts: operator-ws1
+  gather_facts: false
+  roles:
+    - credservice_bait

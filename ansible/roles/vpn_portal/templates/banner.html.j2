@@ -1,0 +1,18 @@
+<!doctype html>
+<!-- {{ ansible_managed }} -->
+<!-- M1.s1 recon flag -- this page is the custom 401 response, served
+     pre-auth to anyone who can reach the portal. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>{{ vpn_portal_company_name }} VPN Portal</title></head>
+<body style="font-family: sans-serif; max-width: 40em; margin: 4em auto;">
+  <h1>{{ vpn_portal_company_name }} &mdash; Remote Access Portal</h1>
+  <p>Authentication required. Authorised staff only.</p>
+  <p style="color:#888; font-size:0.85em;">
+    portal build charlie-vpn-portal/1.4 &middot; ref {{ vpn_portal_flags.m1_s1 }}
+  </p>
+  <hr>
+  <p style="color:#aaa; font-size:0.8em;">
+    Helpdesk: x4400 &middot; default kiosk login is the same as the username
+  </p>
+</body>
+</html>

@@ -1,0 +1,27 @@
+---
+# M2 -- AD foothold via SMB recon + AS-REP roast. The AD user must exist on
+# dc1.charlie BEFORE fs.charlie NTFS-grants it (icacls on an unresolved
+# principal silently fails), so dc1.charlie is played first.
+
+- name: M2 stage 1 -- create the AS-REP-roastable user on dc1.charlie
+  hosts: dc1.charlie
+  gather_facts: false
+  roles:
+    - asrep_bait_user
+
+- name: M2 stage 2 -- plant the IT share + 3 flag files on fs.charlie
+  hosts: fs.charlie
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    smb_fileserver_flags:
+      m2_s1: "{{ flags_by_id['m2.s1'] }}"
+      m2_s2: "{{ flags_by_id['m2.s2'] }}"
+      m2_s3: "{{ flags_by_id['m2.s3'] }}"
+    # SID captured by the DC play (member-server NTAccount->SID lookup races
+    # the LSA cache after a user delete+recreate).
+    smb_fileserver_asrep_user_sid: "{{ hostvars['dc1.charlie']['asrep_bait_user_sid'] }}"
+  roles:
+    - smb_fileserver

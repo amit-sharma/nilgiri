@@ -1,0 +1,48 @@
+---
+# alpha_domain (M8) -- runs on dc1.alpha. Promotes the alpha.local forest,
+# then creates the Domain-Admin deploy service account the M8 poller runs as.
+
+- name: Promote dc1.alpha to the alpha.local forest root DC
+  microsoft.ad.domain:
+    dns_domain_name: '{{ alpha_dns_domain }}'
+    domain_netbios_name: '{{ alpha_netbios }}'
+    safe_mode_password: '{{ alpha_safe_mode_password }}'
+    reboot: true
+  register: alpha_promote
+
+- name: Wait for the AD DS / DNS stack to settle after promotion
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    # Block until the DC answers an LDAP-ish query for its own domain.
+    Get-ADDomain {{ alpha_dns_domain }} | Out-Null
+    'DOMAIN-READY'
+  register: alpha_ready
+  retries: 30
+  delay: 10
+  until: "'DOMAIN-READY' in alpha_ready.stdout"
+  changed_when: false
+
+# --- Domain-Admin deploy account (the M8 poller's run-as identity) --------
+- name: Create the build/deploy Domain-Admin service account
+  microsoft.ad.user:
+    name: '{{ alpha_deploy_account }}'
+    password: '{{ alpha_deploy_account_password }}'
+    password_never_expires: true
+    update_password: on_create
+    description: 'CI/CD deploy agent service account (alpha fleet)'
+    state: present
+
+- name: Add the deploy account to Domain Admins
+  microsoft.ad.group:
+    name: Domain Admins
+    members:
+      add:
+        - '{{ alpha_deploy_account }}'
+    state: present
+
+- name: Grant the deploy account the batch-logon right (scheduled task run-as)
+  ansible.windows.win_user_right:
+    name: SeBatchLogonRight
+    users:
+      - '{{ alpha_netbios }}\{{ alpha_deploy_account }}'
+    action: add

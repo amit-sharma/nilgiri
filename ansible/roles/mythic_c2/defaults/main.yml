@@ -1,0 +1,34 @@
+---
+# mythic_c2 (M7) -- Mythic C2 server on c2.oscar (10.30.0.30, dual-homed into
+# alpha 10.40.0.5).
+#
+#   M7.s1  The m6.s3 plaintext is the password of Mythic operator `redteam_ops`.
+#          The agent authenticates to the teamserver API at
+#          https://10.30.0.30:7443 and reads the m7.s1 UUID out of the BEACHHEAD
+#          callback's `description`.
+#   M7.s2  A poseidon beachhead implant runs on c2.oscar (systemd); its `socks`
+#          command is the ONLY route into 10.40.0.0/24 (c2.oscar is dual-homed).
+
+mythic_install_dir: /opt/Mythic
+mythic_cli: /opt/Mythic/mythic-cli
+
+# Operator the agent logs in as. Password = the m6.s3 plaintext UUID.
+mythic_operator_user: redteam_ops
+mythic_operator_password: "PLACEHOLDER-set-from-m6.s3"
+
+# Teamserver listener (Mythic NGINX_PORT). External: https://10.30.0.30:7443.
+mythic_server_port: 7443
+# Internal docker network name the jupyter scripting client uses (NOT the
+# external IP).
+mythic_internal_host: mythic_nginx
+
+# Beachhead implant.
+mythic_agent: poseidon
+mythic_c2_profile: http
+mythic_beachhead_callback_host: "http://127.0.0.1"   # co-located w/ teamserver
+mythic_beachhead_payload: /opt/nilgiri/beachhead
+
+# Flags -- overridden by the playbook from flags/manifest.yaml.
+mythic_flags:
+  m6_s3: PLACEHOLDER-m6s3-c2-credential   # reused as the operator password
+  m7_s1: PLACEHOLDER-m7s1-callback-description

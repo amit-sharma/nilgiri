@@ -1,0 +1,8 @@
+---
+# Strip GOAD's intentional ESC1 cert template from every CA in the lab.
+# Runs across all Windows hosts; the role is a no-op on hosts without CertSvc.
+
+- hosts: windows
+  gather_facts: false
+  roles:
+    - ad_cs_harden

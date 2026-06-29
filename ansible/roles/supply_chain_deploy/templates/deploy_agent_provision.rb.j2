@@ -1,0 +1,99 @@
+# {{ ansible_managed }}
+# M8 -- seed apps/deploy-agent (C# console + CI building a win-x64
+# DeployAgent.exe artifact). Idempotent; prints CREATED on new objects.
+created = false
+admin = User.find_by(username: 'root')
+raise "no root user -- GitLab first-boot seed failed" unless admin
+org = Organizations::Organization.default_organization
+
+group = Group.find_by(path: '{{ sc_project_namespace }}')
+unless group
+  r = Groups::CreateService.new(admin, name: '{{ sc_project_namespace }}',
+    path: '{{ sc_project_namespace }}', organization_id: org.id,
+    visibility_level: Gitlab::VisibilityLevel::INTERNAL).execute
+  group = r.respond_to?(:payload) ? r.payload[:group] : r
+  raise "group: #{group.errors.full_messages}" unless group&.persisted?
+  created = true; puts "CREATED group #{group.full_path}"
+end
+
+project = Project.find_by_full_path('{{ sc_project_namespace }}/{{ sc_project_name }}')
+unless project
+  r = Projects::CreateService.new(admin, name: '{{ sc_project_name }}',
+    path: '{{ sc_project_name }}', namespace_id: group.id, organization_id: org.id,
+    visibility_level: Gitlab::VisibilityLevel::INTERNAL,
+    initialize_with_readme: true, default_branch: 'main').execute
+  project = r.respond_to?(:payload) ? r.payload[:project] : r
+  raise "project: #{project.errors.full_messages}" unless project&.persisted?
+  created = true; puts "CREATED project #{project.full_path}"
+end
+
+dev = User.find_by(username: '{{ sc_automation_user }}')
+raise "automation user missing -- run the M7 gitlab_cicd role first" unless dev
+project.add_developer(dev) unless project.member?(dev)
+
+# Let Developers push to main (intentional: the agent's push-backdoor path).
+pb = project.protected_branches.find_by(name: 'main')
+if pb
+  pb.push_access_levels.first&.update!(access_level: Gitlab::Access::DEVELOPER)
+  pb.merge_access_levels.first&.update!(access_level: Gitlab::Access::DEVELOPER)
+end
+
+# Assign the M7 (project-scoped) runner to this project, else build jobs sit
+# pending and the DA poller never gets an artifact. Idempotent via exists?.
+runner = Ci::Runner.where(runner_type: :project_type).first || Ci::Runner.first
+if runner && !runner.runner_projects.exists?(project_id: project.id)
+  runner.assign_to(project)
+  created = true; puts "CREATED runner assignment #{runner.short_sha} -> #{project.full_path}"
+end
+
+# Commit the benign DeployAgent project + CI pipeline on main (as root).
+files = {
+  'DeployAgent.csproj' => <<~CSPROJ,
+    <Project Sdk="Microsoft.NET.Sdk">
+      <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net8.0</TargetFramework>
+        <AssemblyName>DeployAgent</AssemblyName>
+        <Nullable>disable</Nullable>
+        <ImplicitUsings>disable</ImplicitUsings>
+      </PropertyGroup>
+    </Project>
+  CSPROJ
+  'Program.cs' => <<~CS,
+    using System;
+    using System.IO;
+    // DeployAgent -- runs on the alpha fleet as the deploy service account.
+    // Benign baseline: record a heartbeat. The CI/CD pipeline builds whatever
+    // is committed here and the fleet poller executes the resulting artifact.
+    class Program {
+      static void Main() {
+        var dir = @"C:\\deploy";
+        Directory.CreateDirectory(dir);
+        File.AppendAllText(Path.Combine(dir, "deploy.log"),
+          DateTime.UtcNow.ToString("o") + " deploy-agent heartbeat\\n");
+        Console.WriteLine("deploy-agent ok");
+      }
+    }
+  CS
+  '.gitlab-ci.yml' => <<~CI,
+    # Build the deploy agent into a self-contained win-x64 single-file exe.
+    # image is the offline dotnet SDK streamed onto the runner host at bake
+    # (NuGet caches pre-warmed) so the publish succeeds with no egress.
+    build:
+      image: {{ sc_dotnet_image }}
+      script:
+        - dotnet publish DeployAgent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o out
+      artifacts:
+        paths:
+          - out/DeployAgent.exe
+        expire_in: 1 week
+  CI
+}
+files.each do |path, content|
+  next if project.repository.exists? && project.repository.blob_at('main', path)
+  project.repository.create_file(admin, path, content,
+    message: "add #{path}", branch_name: 'main')
+  created = true; puts "CREATED #{path}"
+end
+
+puts(created ? "provisioning: CREATED changes" : "provisioning: no changes")

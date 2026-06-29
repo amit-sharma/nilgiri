@@ -1,0 +1,66 @@
+---
+# OpenVPN server PKI + config. Self-contained CA -- this is a closed lab,
+# the CA only ever signs the server cert and the one client cert that
+# corp.ovpn embeds.
+
+- name: Create easy-rsa working dir
+  ansible.builtin.command:
+    cmd: "make-cadir {{ vpn_portal_ovpn_dir }}/easy-rsa"
+    creates: "{{ vpn_portal_ovpn_dir }}/easy-rsa/easyrsa"
+
+- name: Build PKI (CA, server cert, client cert, DH, ta.key)
+  ansible.builtin.shell:
+    chdir: "{{ vpn_portal_ovpn_dir }}/easy-rsa"
+    cmd: |
+      set -e
+      export EASYRSA_BATCH=1 EASYRSA_REQ_CN="charlie-vpn-ca"
+      ./easyrsa init-pki
+      ./easyrsa build-ca nopass
+      ./easyrsa gen-req server nopass
+      ./easyrsa sign-req server server
+      ./easyrsa gen-req corp-client nopass
+      ./easyrsa sign-req client corp-client
+      ./easyrsa gen-dh
+      openvpn --genkey secret ta.key
+    creates: "{{ vpn_portal_ovpn_dir }}/easy-rsa/pki/issued/server.crt"
+
+- name: Stage server cert material
+  ansible.builtin.copy:
+    remote_src: true
+    src: "{{ vpn_portal_ovpn_dir }}/easy-rsa/{{ item.src }}"
+    dest: "{{ vpn_portal_ovpn_dir }}/{{ item.dest }}"
+    mode: "0600"
+  loop:
+    - { src: pki/ca.crt,            dest: ca.crt }
+    - { src: pki/issued/server.crt, dest: server.crt }
+    - { src: pki/private/server.key, dest: server.key }
+    - { src: pki/dh.pem,            dest: dh.pem }
+    - { src: ta.key,                dest: ta.key }
+
+# openvpn-server@.service looks for /etc/openvpn/server/<instance>.conf
+# (not /etc/openvpn/<instance>.conf). The cert paths inside the config are
+# absolute, so they can stay under {{ vpn_portal_ovpn_dir }}.
+- name: Ensure server config dir exists
+  ansible.builtin.file:
+    path: "{{ vpn_portal_ovpn_dir }}/server"
+    state: directory
+    mode: "0755"
+
+- name: Render OpenVPN server config (where the systemd unit looks)
+  ansible.builtin.template:
+    src: openvpn-server.conf.j2
+    dest: "{{ vpn_portal_ovpn_dir }}/server/server.conf"
+    mode: "0644"
+
+# Slurp the client material that corp.ovpn.j2 inlines (its template task in
+# main.yml runs after this).
+- name: Read client material for corp.ovpn inlining
+  ansible.builtin.slurp:
+    src: "{{ vpn_portal_ovpn_dir }}/easy-rsa/{{ item }}"
+  loop:
+    - pki/ca.crt
+    - pki/issued/corp-client.crt
+    - pki/private/corp-client.key
+    - ta.key
+  register: vpn_portal_client_material
+  no_log: true

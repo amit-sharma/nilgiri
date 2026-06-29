@@ -1,0 +1,45 @@
+---
+# supply_chain_deploy (M8 / step 8.1 "C# malware"). Two host targets:
+#   gitlab.alpha -- seed apps/deploy-agent (C# console + CI that builds a
+#     self-contained win-x64 DeployAgent.exe; the M7.s3 `automation` PAT can push).
+#   dc1.alpha -- a scheduled task running as Domain-Admin svc_builddeploy polls
+#     apps/deploy-agent for the latest SUCCESSFUL build artifact and EXECUTES it
+#     as DA (the deploy-trust vulnerability).
+# The m8.s1 flag + M8->M9 SQL bridge credential live in a Domain-Admins-only
+# handoff file on dc1.alpha; DA-gated at rest.
+
+# --- gitlab.alpha: the deploy-agent build project -------------------------
+sc_gitlab_external_url: 'http://10.40.0.20'
+sc_gitlab_container: gitlab
+sc_gitlab_data_dir: /srv/gitlab
+sc_project_namespace: apps
+sc_project_name: deploy-agent
+# Reuse the M7 automation Developer + its PAT (planted in ws.alpha git history, m7.s3).
+sc_automation_user: automation
+sc_automation_pat: 'glpat-nilgiri7s3deploytok'
+# Offline dotnet SDK image (NuGet caches pre-warmed for no-egress publish).
+# KEEP IN SYNC with scripts/m8_m9_bake_installers.sh.
+sc_dotnet_image: 'dotnet-sdk-offline:8.0'
+
+# --- dc1.alpha: the DA deploy poller --------------------------------------
+sc_deploy_dir: 'C:\deploy'
+sc_vault_dir: 'C:\DeployVault'
+sc_handoff_file: 'C:\DeployVault\domain-admin-handoff.txt'
+sc_poll_script: 'C:\DeployVault\poll-and-deploy.ps1'
+sc_task_name: DeployAgentPoll
+# Run-as Domain Admin (created by alpha_domain). Must match alpha_domain's
+# alpha_deploy_account / alpha_deploy_account_password.
+sc_deploy_account: 'ALPHA\svc_builddeploy'
+sc_deploy_account_password: 'Bu1ld-Deploy-2026!'
+# GitLab token the poller uses to fetch artifacts (reuse the automation PAT).
+sc_poller_gitlab_token: 'glpat-nilgiri7s3deploytok'
+
+# Flags + bridge cred -- overridden by the m8_m9 playbook from manifest/vars.
+sc_flags:
+  m8_s1: PLACEHOLDER-m8s1-da-handoff
+# SQL login recovered from the handoff file to reach secrets.alpha in M9.
+# Must match secrets_db's sql_bridge_* vars.
+sc_sql_bridge_user: svc_sql_admin
+sc_sql_bridge_password: 'V4ult-Sql-Adm!n-2026'
+sc_sql_target_host: '10.40.0.30'
+sc_sql_target_db: VaultDb

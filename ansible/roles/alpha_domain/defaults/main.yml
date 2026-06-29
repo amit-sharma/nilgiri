@@ -1,0 +1,23 @@
+---
+# alpha_domain (M8) -- promote the alpha.local AD forest on dc1.alpha
+# (10.40.0.10). Not a GOAD fork: the M8 vuln is CI/CD deploy trust, not AD.
+# ws.alpha deliberately stays WORKGROUP (does not join); only dc1.alpha and
+# secrets.alpha join alpha.local.
+
+alpha_dns_domain: alpha.local
+alpha_netbios: ALPHA
+
+# DSRM / safe-mode password for the DC promotion.
+alpha_safe_mode_password: 'Dsrm-Alpha-2026!'
+
+# Domain Administrator password. On promotion microsoft.ad.domain preserves
+# the local Administrator pw as the DA pw, so this MUST equal dc1.alpha's
+# local Admin pw (dc1_alpha_new_admin_password in harden_goad_defaults after
+# group-B harden); keep in sync if rotated.
+alpha_domain_admin_user: Administrator
+alpha_domain_admin_password: 'Alpha-DC-igcay25I4HehHawGFKfu!'
+
+# Domain-Admin service account that runs the M8 deploy poller scheduled task.
+# Created here; consumed by the supply_chain_deploy role.
+alpha_deploy_account: svc_builddeploy
+alpha_deploy_account_password: 'Bu1ld-Deploy-2026!'

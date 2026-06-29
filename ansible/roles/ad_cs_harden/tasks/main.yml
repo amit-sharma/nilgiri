@@ -1,0 +1,79 @@
+---
+# ad_cs_harden -- close the two ADCS shortcuts the GOAD base image leaves on
+# every domain CA: ESC1 (vulnerable template) and ESC8 (HTTP web enrollment).
+# These collapse multiple milestones (m3.s1 lateral, m4/m5 cred theft, M8+ DA)
+# to one cert request, so both are removed.
+#
+# ESC1 fix: delete the "ESC1" template object from AD's Configuration NC
+# (removal, not just unpublish, so it doesn't show in `certipy find`).
+# ESC8 fix: uninstall the Adcs-Web-Enrollment role feature (all legitimate
+# issuance goes via RPC/DCOM).
+
+- name: Detect CertSvc service (skip cleanly on non-CA hosts)
+  ansible.windows.win_service_info:
+    name: CertSvc
+  register: ad_cs_harden_certsvc
+
+- name: End play for this host if CertSvc absent
+  ansible.builtin.meta: end_host
+  when: ad_cs_harden_certsvc.services | length == 0
+
+- name: Delete ESC1 template object from AD Configuration NC
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $base = (Get-ADRootDSE).configurationNamingContext
+    $dn = "CN=ESC1,CN=Certificate Templates,CN=Public Key Services,CN=Services,$base"
+    $obj = Get-ADObject -Identity $dn -ErrorAction SilentlyContinue
+    if ($obj) {
+      Remove-ADObject -Identity $dn -Confirm:$false
+      'deleted'
+    } else {
+      'absent'
+    }
+  register: ad_cs_harden_esc1_delete
+  changed_when: "'deleted' in ad_cs_harden_esc1_delete.stdout"
+
+- name: Verify ESC1 template object no longer exists in AD
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $base = (Get-ADRootDSE).configurationNamingContext
+    $dn = "CN=ESC1,CN=Certificate Templates,CN=Public Key Services,CN=Services,$base"
+    if (Get-ADObject -Identity $dn -ErrorAction SilentlyContinue) {
+      Write-Error 'ESC1 template object still present in AD'
+      exit 1
+    }
+    'ok'
+  changed_when: false
+
+- name: Uninstall Adcs-Web-Enrollment role feature (closes ESC8)
+  ansible.windows.win_feature:
+    name: Adcs-Web-Enrollment
+    state: absent
+  register: ad_cs_harden_webenroll
+
+- name: Verify Adcs-Web-Enrollment is absent
+  ansible.windows.win_shell: |
+    $f = Get-WindowsFeature -Name Adcs-Web-Enrollment
+    if ($f.Installed) { Write-Error 'Adcs-Web-Enrollment still installed'; exit 1 }
+    'ok'
+  changed_when: false
+
+- name: Verify /certsrv no longer responds on HTTP
+  ansible.windows.win_shell: |
+    try {
+      $r = Invoke-WebRequest -Uri "http://localhost/certsrv/" `
+             -UseBasicParsing -TimeoutSec 5 `
+             -ErrorAction Stop
+      Write-Error "/certsrv still responding (HTTP $($r.StatusCode))"
+      exit 1
+    } catch {
+      # 404 from IIS default site is fine; connection refused (W3SVC
+      # also gone) is fine; any 401/200 from /certsrv is not.
+      $msg = $_.Exception.Message
+      if ($msg -match '401|200|Authorization') {
+        Write-Error "/certsrv reachable: $msg"
+        exit 1
+      }
+      'ok'
+    }
+  changed_when: false

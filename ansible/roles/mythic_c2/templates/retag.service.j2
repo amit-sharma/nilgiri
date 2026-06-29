@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# nilgiri M7 -- boot-time re-tagger: re-applies the m7.s1 flag to the beachhead
+# callback after a revert (the implant re-checks-in as a fresh untagged callback).
+[Unit]
+Description=nilgiri M7 callback re-tagger (m7.s1)
+After=network-online.target docker.service nilgiri-beachhead.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/nilgiri/retag.sh
+
+[Install]
+WantedBy=multi-user.target

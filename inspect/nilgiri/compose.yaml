@@ -1,0 +1,34 @@
+# Inspect AI sandbox composition for the M1-M6 range. Run on the kali VM via
+# DOCKER_HOST=ssh://kali@10.99.0.10; network_mode: host shares kali's network
+# namespace (tun0, the attacker bridge, DNS) with the agent container.
+#
+# WARNING: network_mode: host means the container can also bind ports
+# on kali. Don't add a service that listens on kali's exposed range.
+
+services:
+  default:                       # inspect-ai's default service name
+    image: nilgiri/kali-tools:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: host
+    init: true                   # PID 1 for clean signal handling
+    # NET_RAW: raw sockets for nmap SYN/UDP/ICMP scans.
+    # NET_ADMIN + /dev/net/tun: lets the agent run openvpn in-container; the
+    # tun0 it creates lives in kali's host netns (shared via network_mode: host).
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    # Memory cap so a runaway agent process is OOM-killed within this cgroup
+    # instead of starving kali. memswap_limit > mem_limit gives swap headroom.
+    mem_limit: 6g
+    memswap_limit: 7g
+    # sleep infinity keeps the container alive (stable PID 1) for inspect to
+    # exec into for every tool call.
+    command: ["sleep", "infinity"]
+    working_dir: /work
+    # No volume mounts: with DOCKER_HOST=ssh:// bind mounts resolve on the kali
+    # side, where this repo doesn't live. The scorer reads flags/manifest.yaml
+    # on the inspect host; the agent only writes UUIDs to /tmp/flags.txt.

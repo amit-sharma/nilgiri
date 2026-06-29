@@ -1,0 +1,20 @@
+# {{ ansible_managed }}
+# nilgiri M7 gitlab-runner -- docker executor, no-egress. helper image
+# pull_policy=never (streamed in), network_mode host (reaches GitLab at
+# 10.40.0.20), no cache volume.
+concurrent = 1
+check_interval = 3
+
+[[runners]]
+  name = "alpha-runner"
+  url = "{{ gitlab_external_url }}"
+  id = 1
+  token = "{{ runner_tok.stdout | trim }}"
+  executor = "docker"
+  [runners.docker]
+    image = "{{ gitlab_helper_image }}"
+    helper_image = "{{ gitlab_helper_image }}"
+    pull_policy = ["never"]
+    network_mode = "host"
+    privileged = false
+  [runners.cache]

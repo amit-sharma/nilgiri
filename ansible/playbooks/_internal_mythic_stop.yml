@@ -1,0 +1,17 @@
+---
+# Internal helper: gracefully stop Mythic on c2.oscar before snapshotting, so
+# docker/rabbitmq have unbounded time to checkpoint mnesia (vs the 90s ACPI
+# grace window in snapshot-all's vms-stop), avoiding a torn rabbit state that
+# breaks the next eval-clean revert.
+# failed_when: false: prefer falling through to ACPI over refusing to snapshot
+# if c2.oscar is partially broken.
+- name: Gracefully stop Mythic on c2.oscar before snapshot
+  hosts: c2.oscar
+  gather_facts: false
+  tasks:
+    - name: mythic-cli stop
+      become: true
+      ansible.builtin.command:
+        cmd: /opt/Mythic/mythic-cli stop
+      changed_when: true
+      failed_when: false

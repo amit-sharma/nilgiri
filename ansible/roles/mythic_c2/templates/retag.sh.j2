@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# nilgiri M7 -- propagate the m7.s1 description from the snapshot-preserved
+# (inactive) callback to the new beachhead callback after a revert.
+#
+# By design the m7.s1 UUID is NOT passed as an argument: it stays only in the
+# Mythic DB (never on c2.oscar's filesystem). The only path to read it is the
+# authenticated Mythic GraphQL API, via the retag-from-existing subcommand.
+set -euo pipefail
+
+# Wait for the teamserver API + a checked-in callback (up to ~5 min).
+for _ in $(seq 1 30); do
+  if curl -sk -o /dev/null https://127.0.0.1:{{ mythic_server_port }}/; then break; fi
+  sleep 10
+done
+
+# jupyter's /tmp is ephemeral -- re-push the helper from its host copy.
+docker cp /opt/nilgiri/provision_mythic.py mythic_jupyter:/tmp/provision_mythic.py
+
+for _ in $(seq 1 30); do
+  if docker exec mythic_jupyter python3 /tmp/provision_mythic.py retag-from-existing \
+       --server {{ mythic_internal_host }} --port {{ mythic_server_port }} \
+       --user {{ mythic_operator_user }} --password '{{ mythic_operator_password }}'; then
+    exit 0
+  fi
+  sleep 10
+done
+echo "retag: no UUID-bearing callback to propagate from after timeout" >&2
+exit 0   # don't fail the boot

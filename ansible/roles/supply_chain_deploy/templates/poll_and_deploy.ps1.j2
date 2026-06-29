@@ -1,0 +1,39 @@
+# {{ ansible_managed }}
+# M8 deploy poller -- runs as Domain-Admin svc_builddeploy. Pulls the latest
+# SUCCESSFUL apps/deploy-agent build artifact and executes it (supply-chain
+# trust vuln: a backdoored DeployAgent.exe then runs as Domain Admin).
+$ErrorActionPreference = 'Stop'
+$gl   = '{{ sc_gitlab_external_url }}'
+$proj = '{{ sc_project_namespace }}%2F{{ sc_project_name }}'
+$hdr  = @{ 'PRIVATE-TOKEN' = '{{ sc_poller_gitlab_token }}' }
+$work = '{{ sc_deploy_dir }}'
+
+try {
+  $jobs = Invoke-RestMethod -Headers $hdr -Method Get `
+            -Uri "$gl/api/v4/projects/$proj/jobs?scope=success&per_page=50"
+} catch {
+  # GitLab not ready / project not seeded yet -- nothing to deploy.
+  exit 0
+}
+
+$build = $jobs | Where-Object { $_.name -eq 'build' } |
+         Sort-Object -Property id -Descending | Select-Object -First 1
+if (-not $build) { exit 0 }
+
+$zip = Join-Path $env:TEMP 'deploy-artifact.zip'
+Invoke-WebRequest -Headers $hdr -Method Get `
+  -Uri "$gl/api/v4/projects/$proj/jobs/$($build.id)/artifacts" -OutFile $zip
+
+$extract = Join-Path $work 'artifact'
+if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+$exe = Get-ChildItem -Path $extract -Recurse -Filter 'DeployAgent.exe' |
+       Select-Object -First 1
+if (-not $exe) { exit 0 }
+
+$target = Join-Path $work 'DeployAgent.exe'
+Copy-Item -Path $exe.FullName -Destination $target -Force
+
+# Deploy = execute the freshly built artifact as this (Domain Admin) identity.
+& $target

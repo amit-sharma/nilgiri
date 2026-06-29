@@ -1,0 +1,89 @@
+---
+# Per-clone Windows posture: logging-only (Defender disabled, Windows Update frozen).
+
+- name: Disable Microsoft Defender (group policy)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender
+    name: "{{ item }}"
+    data: 1
+    type: dword
+  loop:
+    - DisableAntiSpyware
+    - DisableAntiVirus
+    - DisableRoutinelyTakingAction
+
+- name: Disable Defender real-time protection (group policy)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection
+    name: "{{ item }}"
+    data: 1
+    type: dword
+  loop:
+    - DisableRealtimeMonitoring
+    - DisableBehaviorMonitoring
+    - DisableOnAccessProtection
+    - DisableScanOnRealtimeEnable
+
+- name: Freeze Windows Update (stop + disable the service)
+  ansible.windows.win_service:
+    name: "{{ item }}"
+    state: stopped
+    start_mode: disabled
+  loop:
+    - wuauserv
+    - UsoSvc
+  failed_when: false
+
+- name: Windows Update group policy -- no auto update
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+    name: "{{ item.name }}"
+    data: "{{ item.data }}"
+    type: dword
+  loop:
+    - { name: NoAutoUpdate, data: 1 }
+    - { name: AUOptions, data: 1 }
+
+# Eval images: wlms.exe force-shuts the VM ~1h after boot once the grace expires.
+# Start=4 + taskkill folded into one SYSTEM call (the key is TrustedInstaller-ACL'd;
+# back-to-back runas->SYSTEM hangs WinRM on fresh WS2022 Eval clones).
+- name: Disable + stop wlms (eval-licensing shutdown watchdog)
+  ansible.windows.win_shell: |
+    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\wlms' -Name Start -Value 4 -Type DWord -ErrorAction SilentlyContinue
+    taskkill /F /IM wlms.exe 2>$null
+    exit 0
+  become: true
+  become_method: runas
+  become_user: SYSTEM
+  changed_when: false
+  failed_when: false
+  failed_when: false
+
+- name: Install OpenSSH Server capability
+  ansible.windows.win_shell: |
+    $cap = Get-WindowsCapability -Online -Name OpenSSH.Server* | Where-Object State -eq NotPresent
+    if ($cap) { Add-WindowsCapability -Online -Name $cap.Name }
+  register: openssh_install
+  changed_when: "'NotPresent' in openssh_install.stdout | default('')"
+  failed_when: false
+
+- name: Enable + start sshd
+  ansible.windows.win_service:
+    name: "{{ item }}"
+    state: started
+    start_mode: auto
+  loop:
+    - sshd
+    - ssh-agent
+  failed_when: false
+
+- name: Open firewall for SSH
+  community.windows.win_firewall_rule:
+    name: OpenSSH-Server-In-TCP
+    localport: 22
+    action: allow
+    direction: in
+    protocol: tcp
+    state: present
+    enabled: true
+  failed_when: false

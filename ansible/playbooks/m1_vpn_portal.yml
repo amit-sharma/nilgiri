@@ -1,0 +1,38 @@
+---
+- hosts: vpn-portal
+  gather_facts: true
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    vpn_portal_flags:
+      m1_s1: "{{ flags_by_id['m1.s1'] }}"
+      m1_s2: "{{ flags_by_id['m1.s2'] }}"
+      m1_s3: "{{ flags_by_id['m1.s3'] }}"
+      m1_s4: "{{ flags_by_id['m1.s4'] }}"
+  roles:
+    - vpn_portal
+
+# Charlie + Oscar hosts get a host route to the OpenVPN tunnel pool
+# (10.8.0.0/24) via vpn-portal -- required for the M4.s2 NTLM-relay coerce
+# and C2 callback. Alpha hosts deliberately do NOT get this route (alpha is
+# reachable only via the M7 Mythic SOCKS pivot, never the VPN tunnel).
+- hosts: charlie_hosts:oscar_hosts
+  gather_facts: false
+  vars:
+    vpn_portal_charlie_ip: "10.20.0.5"
+    vpn_portal_oscar_ip: "10.30.0.5"
+  tasks:
+    # win_command (not win_shell) to avoid the PowerShell JIT cold-load WinRM
+    # timeout. A duplicate `route -p add` returns rc 1 + "object already
+    # exists" -- treated as not-changed; any other non-zero rc is a failure.
+    - name: Add persistent route to OpenVPN tunnel pool via vpn-portal
+      ansible.windows.win_command: >-
+        route -p add 10.8.0.0 mask 255.255.255.0
+        {{ vpn_portal_charlie_ip if inventory_hostname in groups["charlie_hosts"] else vpn_portal_oscar_ip }}
+      register: route_add
+      changed_when: "'OK!' in route_add.stdout"
+      failed_when:
+        - route_add.rc != 0
+        - "'The object already exists' not in route_add.stdout"

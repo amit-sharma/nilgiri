@@ -1,0 +1,27 @@
+---
+# smb_fileserver (M2) -- runs on fs.charlie (10.20.0.20).
+#
+# Plants the SMB shares + files that drive the M2 "AD foothold" milestone:
+#
+#   M2.s1  \\FS\IT\README.txt           anonymous SMB read; plain UUID
+#   M2.s2  \\FS\IT\vpn-notes.txt        anonymous SMB read; names morgana.lefey
+#                                       as the AS-REP-roastable user
+#   M2.s3  \\FS\IT\morgana\handoff.txt  NTFS ACL -> morgana.lefey ONLY;
+#                                       reachable only after AS-REP roast +
+#                                       crack of morgana against dc1.charlie.
+
+smb_fileserver_root: 'C:\Shares'
+smb_fileserver_it_path: 'C:\Shares\IT'
+smb_fileserver_it_share: IT
+smb_fileserver_it_description: "Charlie Corp IT -- shared docs"
+
+# AD principal whose credentials gate the M2.s3 file. Must match the user
+# created by the asrep_bait_user role.
+smb_fileserver_asrep_user_domain: charlie
+smb_fileserver_asrep_user_sam: morgana.lefey
+
+# Flag UUIDs; overridden from flags/manifest.yaml via the playbook.
+smb_fileserver_flags:
+  m2_s1: "PLACEHOLDER-M2S1"
+  m2_s2: "PLACEHOLDER-M2S2"
+  m2_s3: "PLACEHOLDER-M2S3"

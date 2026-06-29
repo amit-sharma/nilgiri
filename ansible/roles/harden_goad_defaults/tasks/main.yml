@@ -1,0 +1,183 @@
+---
+# harden_goad_defaults role -- see defaults/main.yml for the why.
+# Stages gated by harden_stage; the playbook runs the right stage per host.
+
+# ---- Stage 1: AS-REP roast hardening --------------------------------------
+# Strip DONT_REQ_PREAUTH from every user NOT in asrep_roastable_allowlist
+# (DCs only). Filters on UAC bit 4194304 to scope the Get-ADUser query.
+- name: "Disable AS-REP roastability on GOAD-default users (keep allowlist)"
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $allow = @({{ asrep_roastable_allowlist | map('regex_replace', '^(.*)$', "'\1'") | join(', ') }})
+    $users = Get-ADUser -Filter 'userAccountControl -band 4194304' -Properties samAccountName |
+        Where-Object { $allow -notcontains $_.SamAccountName }
+    if ($null -eq $users) { 'no-op'; exit 0 }
+    foreach ($u in $users) {
+        Set-ADAccountControl -Identity $u.SamAccountName -DoesNotRequirePreAuth $false
+        Write-Output "disabled-asrep:$($u.SamAccountName)"
+    }
+  register: asrep_disabled
+  changed_when: "'disabled-asrep:' in (asrep_disabled.stdout | default(''))"
+  when: harden_stage in ('asrep', 'all')
+
+# ---- Stage 2: SPN-on-user-accounts hardening ------------------------------
+# Strip servicePrincipalName from every user account NOT in
+# spn_bearing_allowlist. Machine accounts (names ending `$`) are excluded --
+# they need HOST/<host> SPNs to function.
+- name: "Strip SPNs from non-allowlisted user accounts (kills Kerberoast shortcut)"
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $allow = @({{ spn_bearing_allowlist | map('regex_replace', '^(.*)$', "'\1'") | join(', ') }})
+    $users = Get-ADUser -Filter * -Properties servicePrincipalNames |
+        Where-Object {
+            $_.servicePrincipalNames.Count -gt 0 -and
+            -not $_.SamAccountName.EndsWith('$') -and
+            $allow -notcontains $_.SamAccountName
+        }
+    if ($null -eq $users) { 'no-op'; exit 0 }
+    foreach ($u in $users) {
+        Set-ADUser -Identity $u.SamAccountName -Clear servicePrincipalName
+        Write-Output "cleared-spn:$($u.SamAccountName)"
+    }
+  register: spn_cleared
+  changed_when: "'cleared-spn:' in (spn_cleared.stdout | default(''))"
+  when: harden_stage in ('spn', 'all')
+
+# ---- Stage 2b: Constrained-delegation strip on user accounts --------------
+# Mirrors stage 2 for msDS-AllowedToDelegateTo (a CIFS delegation lets a TGT
+# holder S4U2Self->S4U2Proxy and DCSync). Filter in PowerShell since -Filter
+# doesn't enumerate the multi-valued attribute by length.
+- name: "Strip msDS-AllowedToDelegateTo from non-allowlisted user accounts"
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $allow = @({{ delegation_allowlist | map('regex_replace', '^(.*)$', "'\1'") | join(', ') }})
+    $users = Get-ADUser -Filter * -Properties msDS-AllowedToDelegateTo |
+        Where-Object {
+            $_.'msDS-AllowedToDelegateTo'.Count -gt 0 -and
+            -not $_.SamAccountName.EndsWith('$') -and
+            $allow -notcontains $_.SamAccountName
+        }
+    if ($null -eq $users) { 'no-op'; exit 0 }
+    foreach ($u in $users) {
+        Set-ADUser -Identity $u.SamAccountName -Clear msDS-AllowedToDelegateTo
+        Write-Output "cleared-deleg:$($u.SamAccountName)"
+    }
+  register: deleg_cleared
+  changed_when: "'cleared-deleg:' in (deleg_cleared.stdout | default(''))"
+  when: harden_stage in ('delegation', 'all')
+
+# ---- Stage 2c: Rotate passwords of known shortcut users -------------------
+# Bulk-rotate every domain user except password_rotation_allowlist + built-ins.
+# Per-user derived passwords (SHA256 of SamAccountName | secret): deterministic
+# (re-run no-ops) but unique. See defaults/main.yml for the allowlist rationale.
+- name: "Bulk-rotate domain user passwords (allowlist-inverted)"
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $allow = @({{ password_rotation_allowlist | map('regex_replace', '^(.*)$', "'\1'") | join(', ') }})
+    # Built-ins we never touch even if not allowlisted explicitly
+    $builtin = @('krbtgt','Administrator','Guest','DefaultAccount','WDAGUtilityAccount')
+    $secret = '{{ password_rotation_secret }}'
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+
+    $rotated = @()
+    $skipped = @()
+    Get-ADUser -Filter * | ForEach-Object {
+        $name = $_.SamAccountName
+        if ($name.EndsWith('$'))      { return }                            # machine accounts
+        if ($builtin -contains $name) { $skipped += $name; return }
+        if ($allow   -contains $name) { $skipped += $name; return }
+
+        # Per-user deterministic password: base64(SHA256(name|secret)) with
+        # complexity guarantees appended. base64 has +,/,= which Windows
+        # complexity rules accept but icacls-style scripts choke on; strip
+        # them to keep the password in a safe character class.
+        $bytes  = [System.Text.Encoding]::UTF8.GetBytes("$name|$secret")
+        $hashB  = $sha.ComputeHash($bytes)
+        $b64    = [Convert]::ToBase64String($hashB)
+        $clean  = ($b64 -replace '[+/=]','x').Substring(0, 24)
+        $pw     = "Bx-$clean-A1!"   # 30+ chars, mixed case + digit + special
+
+        try {
+            Set-ADAccountPassword -Identity $name -NewPassword (
+                ConvertTo-SecureString $pw -AsPlainText -Force
+            ) -Reset -ErrorAction Stop
+            $rotated += $name
+        } catch {
+            Write-Output "ERROR:$name : $($_.Exception.Message)"
+        }
+    }
+    Write-Output "rotated-count:$($rotated.Count)"
+    Write-Output "rotated:$($rotated -join ',')"
+    Write-Output "skipped:$($skipped -join ',')"
+  register: bulk_rotated
+  changed_when: "'rotated-count:0' not in (bulk_rotated.stdout | default(''))"
+  when: harden_stage in ('rotate_shortcut_users', 'all')
+
+# ---- Stage 3: dc1.oscar local Administrator rotation ----------------------
+# Break the shared NgtI75cKV+Pu password between dc1.oscar and fs.charlie by
+# rotating dc1.oscar (fs.charlie left untouched -- GOAD-managed). Migration:
+# after the first run, inventory's ansible_password for dc1.oscar MUST be
+# updated to dc1_oscar_new_admin_password or the next play is UNREACHABLE.
+- name: "Rotate dc1.oscar local Administrator (break group A reuse with fs.charlie)"
+  ansible.windows.win_user:
+    name: Administrator
+    password: "{{ dc1_oscar_new_admin_password }}"
+    update_password: always
+    state: present
+  when: harden_stage == 'rotate_admin'
+
+# ---- Stage 4: group-B member local Administrator rotation -----------------
+# Break the shared Nilgiri-WS2022! password across the five not-GOAD-managed
+# hosts (wiki.charlie, web.oscar, db.oscar, dc1.alpha, secrets.alpha).
+# Host-agnostic: the playbook sets group_b_new_password per host. Migration
+# note as stage 3. Special-case dc1.alpha also rotates the alpha.local DA --
+# see defaults/main.yml stage-4 comment for the downstream defaults to sync.
+- name: "Rotate group-B member local Administrator (break Nilgiri-WS2022! reuse)"
+  ansible.windows.win_user:
+    name: Administrator
+    password: "{{ group_b_new_password }}"
+    update_password: always
+    state: present
+  when: harden_stage == 'rotate_group_b_member'
+
+# ---- Stage 5: ms-DS-MachineAccountQuota = 0 --------------------------------
+# Block low-priv users from creating machine accounts (kills RBCD). DCs only.
+- name: "Set ms-DS-MachineAccountQuota = {{ machine_account_quota }} (kill RBCD via fake computers)"
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $dom = Get-ADDomain
+    $current = (Get-ADObject -Identity $dom.DistinguishedName -Properties 'ms-DS-MachineAccountQuota').'ms-DS-MachineAccountQuota'
+    if ($current -eq {{ machine_account_quota }}) {
+        Write-Output "no-op: already {{ machine_account_quota }}"
+        exit 0
+    }
+    Set-ADDomain -Identity $dom.DNSRoot -Replace @{ 'ms-DS-MachineAccountQuota' = {{ machine_account_quota }} }
+    Write-Output "set-mac-quota:$current->{{ machine_account_quota }}"
+  register: mac_quota_set
+  changed_when: "'set-mac-quota:' in (mac_quota_set.stdout | default(''))"
+  when: harden_stage == 'mac_quota'
+
+# ---- Stage 6: Remove GOAD Responder-bait scheduled tasks ------------------
+# GOAD's connect_bot/ntlm_bot/responder_bot tasks mount nonexistent SMB shares
+# under privileged principals (eddard.stark DA, robb.stark Admins); a Responder
+# on oscar.local catches their NTLMv2 -> instant DA, bypassing M5+ and the
+# m4.s4 gate. m4.s3 is the intended Responder surface, so removing these
+# closes the shortcut without dropping scored attack surface.
+- name: "Remove GOAD Responder-bait scheduled tasks (connect_bot/ntlm_bot/responder_bot)"
+  ansible.windows.win_shell: |
+    $names = @('connect_bot','ntlm_bot','responder_bot')
+    $removed = @()
+    foreach ($n in $names) {
+        if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $n -Confirm:$false
+            $removed += $n
+        }
+    }
+    if ($removed.Count -eq 0) {
+        Write-Output "no-op: bot tasks already absent"
+    } else {
+        Write-Output "removed-bot-tasks:$($removed -join ',')"
+    }
+  register: bot_tasks_removed
+  changed_when: "'removed-bot-tasks:' in (bot_tasks_removed.stdout | default(''))"
+  when: harden_stage == 'remove_bot_tasks'

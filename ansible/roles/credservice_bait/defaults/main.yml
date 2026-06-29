@@ -1,0 +1,35 @@
+---
+# credservice_bait (M6) -- registers + configures the CredService RE-bait
+# Windows service on operator-ws1. CredService.exe + the SYSTEM-only key.bin
+# are baked into the COW volume by scripts/m6_bake_installers.sh.
+#
+# Attack chain:
+#   Entry  M5.s6 LAPS -> operator-ws1\Administrator (RID 500) local-admin SMB.
+#   M6.s1  RE CredService.exe (ACL = SYSTEM:F + RID-500 Admin:R). Recovers the
+#          ServiceTag UUID (m6.s1 flag), the AES-GCM CipherBlob constant, and
+#          the key path (C:\ProgramData\CredService\key.bin).
+#   M6.s2  Token-impersonate local Admin -> SYSTEM (PrintSpoofer/GodPotato +
+#          SeImpersonate). Easier PtH-to-SYSTEM routes are blocked: SCM SDDL
+#          (SC_MANAGER_CREATE_SERVICE stripped), Task Scheduler ACL, SeDebug
+#          revoked from Admins -- all applied by this role, LAST. With SYSTEM,
+#          read key.bin (SDDL D:P(A;;FA;;;SY), SYSTEM-only); the 16 bytes as a
+#          UUID = m6.s2.
+#   M6.s3  AES-GCM-decrypt the m6.s1 CipherBlob with the m6.s2 key -> plaintext
+#          UUID = m6.s3 flag, also the credential M7 uses for the C2 management
+#          service. No on-disk creds.bin shortcut (TickerService no longer
+#          writes plaintext to disk).
+
+credservice_install_dir: 'C:\Program Files\CredService'
+credservice_binary: 'C:\Program Files\CredService\CredService.exe'
+credservice_data_dir: 'C:\ProgramData\CredService'
+credservice_key_file: 'C:\ProgramData\CredService\key.bin'
+credservice_service_name: 'CredService'
+credservice_service_display: 'CredService Cache Refresher'
+credservice_service_description: 'Internal credential cache refresh worker (nilgiri M6 RE bait).'
+
+# Recorded build provenance -- updated by scripts/m6_bake_installers.sh
+# after each rebuild. verify_hardening pins these for regression
+# detection (catches accidental fall-back to the old binary).
+credservice_binary_sha256: 'PENDING-set-after-m6-bake'
+credservice_cipherblob_offset: 0       # byte offset in the binary
+credservice_cipherblob_length: 64      # 12 nonce + 16 tag + 36 ct (for a 36-byte UUID plaintext)

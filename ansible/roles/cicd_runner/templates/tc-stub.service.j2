@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# nilgiri M7 -- lightweight TeamCity REST stub on :{{ cicd_teamcity_port }}.
+[Unit]
+Description=nilgiri M7 TeamCity REST stub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/tc_stub.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

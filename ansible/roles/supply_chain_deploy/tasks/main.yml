@@ -1,0 +1,12 @@
+---
+# supply_chain_deploy (M8) -- dispatch by host. The playbook applies this role
+# to gitlab.alpha (seed the build project) BEFORE dc1.alpha (the DA poller),
+# so the project exists when the poller first runs.
+
+- name: "M8 -- seed apps/deploy-agent build project (gitlab.alpha)"
+  ansible.builtin.include_tasks: gitlab_deploy_agent.yml
+  when: inventory_hostname == 'gitlab.alpha'
+
+- name: "M8 -- DA deploy poller + DA-gated handoff (dc1.alpha)"
+  ansible.builtin.include_tasks: dc1_deploy_poller.yml
+  when: inventory_hostname == 'dc1.alpha'

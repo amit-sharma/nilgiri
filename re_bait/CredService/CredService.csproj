@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Nilgiri.CredService</RootNamespace>
+    <AssemblyName>CredService</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Strip pdbs; mild obfuscation only. The paper notes that an
+         expert RE'er should clear this in ~1 hour. Don't go further. -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- M6.s1: the flag UUID rides in the binary's AssemblyMetadata.
+         The actual value is supplied at build time by
+         scripts/seed_credservice.py via -p:ServiceTag=<uuid>. -->
+    <ServiceTag Condition=" '$(ServiceTag)' == '' ">00000000-0000-0000-0000-000000000000</ServiceTag>
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <InformationalVersion>$(Version)+tag.$(ServiceTag)</InformationalVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="ServiceTag" Value="$(ServiceTag)" />
+  </ItemGroup>
+</Project>

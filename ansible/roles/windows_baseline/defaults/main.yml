@@ -1,0 +1,4 @@
+---
+windows_baseline_freeze_updates: true
+windows_baseline_disable_defender: true
+windows_baseline_install_openssh: true

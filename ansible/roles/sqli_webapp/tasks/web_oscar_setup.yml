@@ -1,0 +1,176 @@
+---
+# web_oscar_setup.yml -- runs on web.oscar.
+#
+# web.oscar is the WEB FRONT END ONLY in the redesigned M5 tail: it hosts
+# the vulnerable /search.aspx (M5.s1 recon + the M4->M5 Windows-Auth gate)
+# and connects to the SQL backend on db.oscar. The M5.s5 RBCD step, the
+# M5.s6 LAPS target, the gpo.maintainer creds.txt bridge, the M6
+# CredService host, and the SCM/Task/SeDebug hardening have all MOVED:
+#   - M5.s5 is now an S4U LDAP read of svc-sentinel$ (dc1.oscar).
+#   - M5.s6 LAPS now lives on OPERATOR-WS1$ (read via laps.reader).
+#   - M6 (CredService) + its hardening now live on operator-ws1
+#     (credservice_bait role / m6_credservice.yml).
+# web.oscar therefore no longer rotates its local Administrator and keeps
+# its baseline group-B password (see ansible/inventory/hosts.yml).
+#
+# Installs IIS + ASP.NET 4.5, deploys the vulnerable search.aspx (string-
+# concatenated query against db.oscar), and runs the SearchAppPool as the
+# oscar\svc_searchapp domain account (web app pool identity only -- no
+# delegation).
+
+- name: Install IIS + ASP.NET 4.5 + Mgmt tools + Windows Auth
+  ansible.windows.win_feature:
+    name:
+      - Web-Server
+      - Web-Asp-Net45
+      - Web-Net-Ext45
+      - Web-Default-Doc
+      - Web-Http-Errors
+      - Web-Static-Content
+      # Web-Mgmt-Console provides Microsoft.Web.Administration.dll which
+      # the win_iis_webapppool / win_iis_website Ansible modules P/Invoke.
+      # Without it: "Could not find file ...inetsrv\Microsoft.Web.Administration.dll".
+      - Web-Mgmt-Console
+      # Web-Windows-Auth installs the IIS NTLM/Negotiate auth module so
+      # the SearchApp site can require Windows Auth (M4->M5 pivot: the
+      # agent's helpdesk.bridge credential, recovered from the M4.s3
+      # KeePass DB, satisfies this challenge).
+      - Web-Windows-Auth
+      # Web-Url-Auth provides IIS URL Authorization so Web.config can restrict
+      # /search.aspx to helpdesk.bridge ONLY (the M4.s4 gate). Without it the
+      # <authorization> section under system.webServer is unrecognised -> 500.19.
+      - Web-Url-Auth
+    state: present
+  register: iis_feat
+
+- name: Reboot if IIS install asked for one
+  ansible.windows.win_reboot:
+    reboot_timeout: 600
+  when: iis_feat.reboot_required
+
+# applicationHost.config locks the authentication + authorization sections by
+# default; any per-app Web.config override of anonymousAuthentication,
+# windowsAuthentication, or the URL authorization rules triggers HTTP 500.21
+# "config locked" / 500.19 without these unlocks. Mirrors the same unlock dance
+# the M4 wiki role does (see wiki_xss_csrf/tasks/mediawiki.yml).
+- name: Unlock IIS auth + authorization sections so Web.config can override
+  ansible.windows.win_shell: |
+    $cmd = "$env:windir\system32\inetsrv\appcmd.exe"
+    foreach ($sec in @(
+      'system.webServer/security/authentication/anonymousAuthentication',
+      'system.webServer/security/authentication/windowsAuthentication',
+      'system.webServer/security/authorization'
+    )) {
+      & $cmd unlock config -section:$sec | Out-Null
+    }
+    "unlocked"
+  register: iis_unlock
+  changed_when: false
+
+- name: Create the app directory
+  ansible.windows.win_file:
+    path: "{{ sqli_app_path }}"
+    state: directory
+
+- name: Deploy the static landing page
+  ansible.windows.win_copy:
+    src: Default.aspx
+    dest: "{{ sqli_app_path }}\\Default.aspx"
+
+- name: Render the (intentionally vulnerable) search page with its flag
+  ansible.windows.win_template:
+    src: search.aspx.j2
+    dest: "{{ sqli_app_path }}\\search.aspx"
+
+- name: Render Web.config (connection string -> db.oscar, customErrors Off)
+  ansible.windows.win_template:
+    src: Web.config.j2
+    dest: "{{ sqli_app_path }}\\Web.config"
+
+# Grant the service account read+execute on the app dir so IIS w3wp.exe
+# running as oscar\svc_searchapp can serve the files.
+- name: Grant svc_searchapp read+execute on app directory
+  ansible.windows.win_acl:
+    path: "{{ sqli_app_path }}"
+    user: "OSCAR\\{{ sqli_service_account }}"
+    rights: ReadAndExecute,ListDirectory
+    type: allow
+    inherit: ContainerInherit,ObjectInherit
+    propagation: None
+    state: present
+
+# Pre-stage the password to allow win_iis_webapppool's SpecificUser
+# identity. We use a credential cache via SetCredential PowerShell so
+# the password is not echoed in the playbook log.
+- name: Create the app pool running as svc_searchapp (SpecificUser)
+  community.windows.win_iis_webapppool:
+    name: "{{ sqli_app_pool }}"
+    state: started
+    attributes:
+      processModel.identityType: SpecificUser
+      processModel.userName: "OSCAR\\{{ sqli_service_account }}"
+      processModel.password: "{{ sqli_service_account_password }}"
+      managedRuntimeVersion: "v4.0"
+
+- name: Remove default 'Default Web Site' if present (frees port 80)
+  community.windows.win_iis_website:
+    name: "Default Web Site"
+    state: absent
+  failed_when: false
+
+- name: Publish the SearchApp IIS site
+  community.windows.win_iis_website:
+    name: SearchApp
+    state: started
+    port: 80
+    physical_path: "{{ sqli_app_path }}"
+    application_pool: "{{ sqli_app_pool }}"
+    hostname: ""    # listen on all hostnames
+
+- name: Open firewall for HTTP (80/tcp)
+  community.windows.win_firewall_rule:
+    name: "SearchApp HTTP (80) - oscar"
+    enabled: true
+    direction: in
+    action: allow
+    protocol: tcp
+    localport: 80
+    state: present
+
+# Force a worker recycle so the new app pool identity takes effect
+# even if the pool already existed from a prior run.
+- name: Recycle the app pool to pick up identity changes
+  ansible.windows.win_shell: |
+    Import-Module WebAdministration
+    Restart-WebAppPool -Name '{{ sqli_app_pool }}'
+    "recycled"
+  register: recycle
+  changed_when: "'recycled' in recycle.stdout"
+  failed_when: false
+
+# ---- Migration hygiene: strip old-design artifacts from web.oscar -----
+# Before the M5-tail redesign, web.oscar hosted M6 (CredService) and the
+# M5.s5 ws.admin profile. Those moved to operator-ws1 / the dc1 sentinel.
+# Remove any leftovers so verify_hardening's "web.oscar carries none of
+# this" assertion holds. All no-ops on a clean provision.
+- name: Remove legacy CredService service if present (old M6 layout)
+  ansible.windows.win_shell: |
+    if (Get-Service -Name CredService -ErrorAction SilentlyContinue) {
+      Stop-Service CredService -Force -ErrorAction SilentlyContinue
+      sc.exe delete CredService | Out-Null
+      "removed"
+    } else { "absent" }
+  register: stale_cs_web
+  changed_when: stale_cs_web.stdout is search('removed')
+  failed_when: false
+
+- name: Remove legacy CredService dirs + ws.admin M5.s5 profile (old layout)
+  ansible.windows.win_file:
+    path: '{{ item }}'
+    state: absent
+  loop:
+    - 'C:\Program Files\CredService'
+    - 'C:\ProgramData\CredService'
+    - 'C:\Users\ws.admin\Documents\m5s5.txt'
+    - 'C:\Users\ws.admin\Documents\creds.txt'
+  failed_when: false

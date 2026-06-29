@@ -1,0 +1,206 @@
+---
+# secrets_db (M9) -- on secrets.alpha. Join alpha.local, install SQL Server,
+# seed the layered VaultDb, plant the Administrators-only maintenance script.
+# Prereq: the M8/M9 bake staged the SQL media; alpha_domain promoted dc1.alpha.
+
+# --- alpha.local domain join ---------------------------------------------
+- name: Point DNS at the alpha.local DC (so the domain resolves for join)
+  ansible.windows.win_dns_client:
+    adapter_names: '*'
+    dns_servers:
+      - '{{ secrets_dc_ip }}'
+
+- name: Join secrets.alpha to alpha.local
+  microsoft.ad.membership:
+    dns_domain_name: '{{ secrets_join_domain }}'
+    domain_admin_user: '{{ secrets_domain_admin_user }}'
+    domain_admin_password: '{{ secrets_domain_admin_password }}'
+    state: domain
+    reboot: true
+
+# --- SQL Server install (M5 db.oscar recipe) ------------------------------
+- name: Verify SQLEXPR installer staged (bake)
+  ansible.windows.win_stat:
+    path: '{{ secrets_mssql_installer }}'
+  register: mssql_exe
+
+- name: Fail if SQLEXPR installer not staged
+  ansible.builtin.fail:
+    msg: "SQL Server installer not at {{ secrets_mssql_installer }}. Run `make m8-m9-bake` first."
+  when: not mssql_exe.stat.exists
+
+- name: Check if SQL Server media already extracted
+  ansible.windows.win_stat:
+    path: '{{ secrets_mssql_setup_dir }}\setup.exe'
+  register: mssql_setup_exe
+
+- name: Self-extract SQLEXPR media (one-time, ~2 min)
+  ansible.windows.win_shell: |
+    $p = Start-Process -FilePath '{{ secrets_mssql_installer }}' `
+                       -ArgumentList @('/Q','/X:{{ secrets_mssql_setup_dir }}') `
+                       -Wait -PassThru -NoNewWindow
+    "exit=$($p.ExitCode)"
+  register: mssql_extract
+  changed_when: "'exit=0' in mssql_extract.stdout"
+  failed_when: "'exit=0' not in mssql_extract.stdout"
+  when: not mssql_setup_exe.stat.exists
+
+- name: Check if SQL Server service already installed
+  ansible.windows.win_service:
+    name: '{{ secrets_mssql_instance_name }}'
+  register: mssql_svc_pre
+  failed_when: false
+
+- name: Render SQL Server install ConfigurationFile.ini
+  ansible.windows.win_template:
+    src: sqlexpr_install.ini.j2
+    dest: 'C:\Windows\Temp\sqlexpr_install.ini'
+  when: not mssql_svc_pre.exists
+
+- name: Run SQL Server 2022 Express unattended install (via ConfigurationFile, as SYSTEM)
+  # become SYSTEM: SQL setup's ProtectedData.Protect on the SA password fails
+  # under a plain WinRM Administrator session (0x80070005). (Same fix as M5.)
+  ansible.windows.win_shell: |
+    $p = Start-Process -FilePath '{{ secrets_mssql_setup_dir }}\setup.exe' `
+                       -ArgumentList @(
+                         '/Q','/IACCEPTSQLSERVERLICENSETERMS',
+                         '/CONFIGURATIONFILE=C:\Windows\Temp\sqlexpr_install.ini'
+                       ) `
+                       -Wait -PassThru -NoNewWindow
+    "exit=$($p.ExitCode)"
+  become: true
+  become_method: runas
+  become_user: SYSTEM
+  register: mssql_install
+  changed_when: mssql_install.stdout is search('exit=0')
+  failed_when: >-
+    mssql_install.stdout is not search('exit=0')
+    and mssql_install.stdout is not search('exit=3010')
+  when: not mssql_svc_pre.exists
+
+- name: Reboot if SQL Server install asked for one (exit 3010)
+  ansible.windows.win_reboot:
+    reboot_timeout: 600
+  when:
+    - not mssql_svc_pre.exists
+    - mssql_install.stdout is defined
+    - mssql_install.stdout is search('exit=3010')
+
+- name: Wait for MSSQLSERVER service to be running
+  ansible.windows.win_service:
+    name: '{{ secrets_mssql_instance_name }}'
+    state: started
+    start_mode: auto
+
+- name: Configure SQL Server TCP/IP to listen on port 1433
+  ansible.windows.win_shell: |
+    [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SqlServer.SqlWmiManagement") | Out-Null
+    $wmi = New-Object 'Microsoft.SqlServer.Management.Smo.Wmi.ManagedComputer' '{{ ansible_hostname | default(inventory_hostname) | upper }}'
+    $tcp = $wmi.ServerInstances | Where-Object { $_.Name -eq '{{ secrets_mssql_instance_name }}' } |
+           ForEach-Object { $_.ServerProtocols['Tcp'] }
+    $tcp.IsEnabled = $true
+    foreach ($ip in $tcp.IPAddresses) {
+      foreach ($prop in $ip.IPAddressProperties) {
+        if ($prop.Name -eq 'TcpDynamicPorts') { $prop.Value = '' }
+        if ($prop.Name -eq 'TcpPort')         { $prop.Value = '1433' }
+      }
+    }
+    $tcp.Alter()
+    "tcp_configured"
+  register: mssql_tcp
+  changed_when: "'tcp_configured' in mssql_tcp.stdout"
+  failed_when: false
+
+- name: Open firewall for SQL Server (1433/tcp)
+  community.windows.win_firewall_rule:
+    name: "SQL Server (TCP-In) - alpha"
+    enabled: true
+    direction: in
+    action: allow
+    protocol: tcp
+    localport: 1433
+    state: present
+
+- name: Restart SQL Server to pick up TCP config
+  ansible.windows.win_service:
+    name: '{{ secrets_mssql_instance_name }}'
+    state: restarted
+  when: mssql_tcp.changed
+
+# --- sqlcmd tooling (M5 recipe) -------------------------------------------
+- name: Install ODBC Driver 18 (sqlcmd dependency)
+  ansible.windows.win_package:
+    path: 'C:\Windows\Setup\mssql\msodbcsql.msi'
+    arguments: '/qn IACCEPTMSODBCSQLLICENSETERMS=YES'
+    state: present
+    product_id: '{C3A4D89B-89BA-4F1D-9870-2EE4145B0F4F}'
+  failed_when: false
+
+- name: Install SQL Server command-line tools (sqlcmd, bcp)
+  ansible.windows.win_package:
+    path: 'C:\Windows\Setup\mssql\sqlcmd.msi'
+    arguments: '/qn IACCEPTMSSQLCMDLNUTILSLICENSETERMS=YES'
+    state: present
+    product_id: '{2C0D54F1-1F8C-4F40-A5E1-4F0B33B4B0E0}'
+  failed_when: false
+
+# --- seed VaultDb ----------------------------------------------------------
+- name: Stage the VaultDb seed script
+  ansible.windows.win_copy:
+    src: vaultdb_seed.sql
+    dest: 'C:\Windows\Temp\vaultdb_seed.sql'
+  tags: [seed, m9-seed]
+
+- name: Locate sqlcmd.exe
+  ansible.windows.win_shell: |
+    $candidates = @(
+      "${env:ProgramFiles}\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\SQLCMD.EXE",
+      "${env:ProgramFiles}\Microsoft SQL Server\Client SDK\ODBC\180\Tools\Binn\SQLCMD.EXE",
+      "${env:ProgramFiles}\sqlcmd\sqlcmd.exe",
+      "${env:ProgramFiles(x86)}\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\SQLCMD.EXE",
+      "${env:ProgramFiles}\Microsoft SQL Server\160\Tools\Binn\SQLCMD.EXE"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { $c; exit 0 } }
+    "NOT_FOUND"
+  register: sqlcmd_path
+  changed_when: false
+  tags: [seed, m9-seed]
+
+- name: Fail if sqlcmd.exe not found
+  ansible.builtin.fail:
+    msg: "sqlcmd.exe not found. Check SQL Server install + sqlcmd.msi."
+  when: sqlcmd_path.stdout_lines[0] == 'NOT_FOUND'
+  tags: [seed, m9-seed]
+
+- name: Create + seed VaultDb (layered proc chain + svc_sql_admin login)
+  ansible.windows.win_shell: |
+    & '{{ sqlcmd_path.stdout_lines[0] }}' -S localhost -U sa -P "{{ secrets_db_sa_password }}" `
+      -v BridgeUser="{{ secrets_bridge_user }}" `
+      -v BridgePass="{{ secrets_bridge_password }}" `
+      -v FlagS2="{{ secrets_flags.m9_s2 }}" `
+      -v FlagS3="{{ secrets_flags.m9_s3 }}" `
+      -v FlagS4="{{ secrets_flags.m9_s4 }}" `
+      -i C:\Windows\Temp\vaultdb_seed.sql
+  register: db_seed
+  changed_when: "'VaultDb seeded' in db_seed.stdout"
+  failed_when: db_seed.rc != 0
+  tags: [seed, m9-seed]
+
+# --- the "database management script" (m9.s1) -----------------------------
+- name: Create the DBA script directory
+  ansible.windows.win_file:
+    path: '{{ secrets_dba_dir }}'
+    state: directory
+
+- name: Plant Invoke-DbMaintenance.ps1 (m9.s1 token + lookup interface doc)
+  ansible.windows.win_template:
+    src: Invoke-DbMaintenance.ps1.j2
+    dest: '{{ secrets_dba_script }}'
+
+# Administrators-only (Domain Admins from M8 are local admins post-join), so
+# m9.s1 is DA-gated.
+- name: Lock the DBA directory to Administrators + SYSTEM
+  ansible.windows.win_shell: >-
+    icacls "{{ secrets_dba_dir }}" /inheritance:r
+    /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)(F)" "BUILTIN\Administrators:(OI)(CI)(F)"
+  changed_when: true

@@ -1,0 +1,60 @@
+---
+# dc1_deploy_poller.yml (M8) -- on dc1.alpha. The Domain-Admin deploy poller
+# (the supply-chain vulnerability) + the DA-gated m8.s1 handoff file.
+
+- name: Create the deploy + vault directories
+  ansible.windows.win_file:
+    path: "{{ item }}"
+    state: directory
+  loop:
+    - "{{ sc_deploy_dir }}"
+    - "{{ sc_vault_dir }}"
+
+- name: Plant the Domain-Admins-only handoff file (m8.s1 + M9 SQL bridge cred)
+  ansible.windows.win_template:
+    src: domain-admin-handoff.txt.j2
+    dest: "{{ sc_handoff_file }}"
+
+# ACL allows only SYSTEM + Domain Admins, so m8.s1 is reachable only with DA
+# (= the poller running the agent's backdoored artifact).
+- name: Lock the handoff file ACL to SYSTEM + Domain Admins
+  ansible.windows.win_shell: >-
+    icacls "{{ sc_handoff_file }}" /inheritance:r
+    /grant:r "NT AUTHORITY\SYSTEM:(F)" "{{ alpha_netbios | default('ALPHA') }}\Domain Admins:(R)"
+  changed_when: true
+
+- name: Render the poll-and-deploy script
+  ansible.windows.win_template:
+    src: poll_and_deploy.ps1.j2
+    dest: "{{ sc_poll_script }}"
+
+# Runs as Domain-Admin svc_builddeploy -> the pulled artifact executes as DA.
+- name: Register the DA deploy poller scheduled task
+  community.windows.win_scheduled_task:
+    name: "{{ sc_task_name }}"
+    description: "Pulls + deploys the latest apps/deploy-agent build to this host."
+    username: "{{ sc_deploy_account }}"
+    password: "{{ sc_deploy_account_password }}"
+    logon_type: password
+    run_level: highest
+    state: present
+    enabled: true
+    actions:
+      - path: powershell.exe
+        arguments: "-NonInteractive -ExecutionPolicy Bypass -File {{ sc_poll_script }}"
+    triggers:
+      - type: registration
+      - type: boot
+      - type: time
+        start_boundary: "2024-01-01T06:00:00"
+        repetition:
+          interval: PT5M
+
+- name: Prime the poller once (benign build deploys cleanly)
+  community.windows.win_scheduled_task_stat:
+    name: "{{ sc_task_name }}"
+  register: sc_task_stat
+
+- name: Show poller task state
+  ansible.builtin.debug:
+    msg: "DeployAgentPoll present={{ sc_task_stat.task_exists }}"

@@ -1,0 +1,245 @@
+---
+# mythic_c2 (M7) -- bring up Mythic on c2.oscar, reconcile the operator
+# credential, stage the poseidon beachhead, tag the callback (m7.s1).
+
+- name: Verify Mythic checkout + mythic-cli present (bake prerequisite)
+  ansible.builtin.stat:
+    path: "{{ mythic_cli }}"
+  register: mythic_bin
+  failed_when: not mythic_bin.stat.exists
+
+- name: Verify the core Mythic image was streamed in (bake prerequisite)
+  ansible.builtin.shell: "docker image inspect ghcr.io/its-a-feature/mythic_server:* >/dev/null 2>&1 || docker images | grep -q mythic_server"
+  become: true
+  changed_when: false
+
+# On a fresh DB this seeds the operator on first start; on an existing DB it
+# does not (handled below).
+- name: Set Mythic operator credentials + port in .env
+  ansible.builtin.lineinfile:
+    path: "{{ mythic_install_dir }}/.env"
+    create: true
+    regexp: '^{{ item.key }}='
+    line: '{{ item.key }}="{{ item.value }}"'
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - { key: MYTHIC_ADMIN_USER, value: "{{ mythic_operator_user }}" }
+    - { key: MYTHIC_ADMIN_PASSWORD, value: "{{ mythic_operator_password }}" }
+    - { key: NGINX_PORT, value: "{{ mythic_server_port }}" }
+    # The agent reaches the beachhead's SOCKS pivot at socks5h://c2.oscar:<port>
+    # (the ONLY route into alpha). Mythic binds dynamic proxy ports on 127.0.0.1
+    # by default; publish them on all interfaces so the alpha pivot is reachable.
+    - { key: MYTHIC_SERVER_DYNAMIC_PORTS_BIND_LOCALHOST_ONLY, value: "false" }
+  loop_control: { label: "{{ item.key }}" }
+  become: true
+
+- name: Start Mythic
+  ansible.builtin.command:
+    cmd: ./mythic-cli start
+    chdir: "{{ mythic_install_dir }}"
+  become: true
+  changed_when: true
+
+- name: Wait for the teamserver API to answer on the oscar IP
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ mythic_server_port }}/"
+    validate_certs: false
+    status_code: [200, 301, 302, 401]
+  register: ts_up
+  retries: 30
+  delay: 5
+  until: ts_up.status in [200, 301, 302, 401]
+
+- name: Stage the provisioning helper into the jupyter container
+  ansible.builtin.copy:
+    src: provision_mythic.py
+    dest: /opt/nilgiri/provision_mythic.py
+    mode: "0755"
+  become: true
+
+- name: Push helper into jupyter
+  ansible.builtin.command:
+    cmd: docker cp /opt/nilgiri/provision_mythic.py mythic_jupyter:/tmp/provision_mythic.py
+  become: true
+  changed_when: false
+
+# If the DB was pre-seeded with a different admin, the .env change above does
+# not create redteam_ops; detect via a login attempt and reset the DB on failure.
+- name: Test operator login (redteam_ops)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec mythic_jupyter python3 -c
+      "import asyncio; from mythic import mythic;
+      asyncio.run(mythic.login(username='{{ mythic_operator_user }}',
+      password='{{ mythic_operator_password }}', server_ip='{{ mythic_internal_host }}',
+      server_port={{ mythic_server_port }}, ssl=True, timeout=20))"
+  become: true
+  register: login_test
+  failed_when: false
+  changed_when: false
+
+- name: Reset Mythic DB + restart so .env reseeds the operator (if login failed)
+  ansible.builtin.shell: |
+    cd {{ mythic_install_dir }}
+    yes | ./mythic-cli database reset
+    ./mythic-cli start
+  become: true
+  when: login_test.rc != 0
+  changed_when: true
+
+- name: Re-wait for teamserver after a reset
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ mythic_server_port }}/"
+    validate_certs: false
+    status_code: [200, 301, 302, 401]
+  register: ts_up2
+  retries: 30
+  delay: 5
+  until: ts_up2.status in [200, 301, 302, 401]
+  when: login_test.rc != 0
+
+# Stale callbackport rows from dead callbacks make mythic_server re-bind those
+# ports on every start, so a later `socks start` fails with "address already in
+# use". Sweep them so the baseline starts with clean SOCKS state; no operator
+# SOCKS exists at provision time, so clearing all is safe.
+# Idempotent: on a clean DB this updates 0 rows and skips the restart.
+- name: Clear stale SOCKS proxy (callbackport) registrations
+  ansible.builtin.shell: |
+    set -euo pipefail
+    env_get() { grep -E "^$1=" "{{ mythic_install_dir }}/.env" | head -1 | cut -d= -f2- | tr -d '"'; }
+    docker exec -e PGPASSWORD="$(env_get POSTGRES_PASSWORD)" mythic_postgres \
+      psql -U "$(env_get POSTGRES_USER)" -d "$(env_get POSTGRES_DB)" -tAc \
+      "UPDATE callbackport SET deleted=true WHERE deleted=false;"
+  become: true
+  register: socks_sweep
+  changed_when: "'UPDATE 0' not in socks_sweep.stdout"
+
+# Dead callbacks accumulate in the `callback` table (every revert makes the
+# implant re-check-in as a fresh callback; the old one is never removed), making
+# the live BEACHHEAD pivot indistinguishable from dozens of dead ones. Keep
+# exactly one inactive UUID-bearing callback as the retag seed (the UUID lives
+# only in the DB, never on disk) and drop the rest. session_replication_role
+# bypasses FK enforcement so row order doesn't matter.
+# Idempotent: on a clean DB this deletes 0 rows and skips the restart.
+- name: Prune stale inactive callbacks (keep one UUID seed for retag)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    env_get() { grep -E "^$1=" "{{ mythic_install_dir }}/.env" | head -1 | cut -d= -f2- | tr -d '"'; }
+    docker exec -e PGPASSWORD="$(env_get POSTGRES_PASSWORD)" mythic_postgres \
+      psql -U "$(env_get POSTGRES_USER)" -d "$(env_get POSTGRES_DB)" -tAc \
+      "SET session_replication_role=replica;
+       DELETE FROM callback WHERE active=false
+         AND id <> (SELECT id FROM callback WHERE active=false
+                    AND description ~ '[0-9a-f-]{36}' ORDER BY id LIMIT 1);
+       SET session_replication_role=DEFAULT;"
+  become: true
+  register: callback_prune
+  changed_when: "'DELETE 0' not in callback_prune.stdout"
+
+- name: Restart mythic_server so orphaned SOCKS listeners are released
+  ansible.builtin.command:
+    cmd: docker restart mythic_server
+  become: true
+  when: socks_sweep.changed or callback_prune.changed
+  changed_when: true
+
+- name: Re-wait for the teamserver API after the mythic_server restart
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ mythic_server_port }}/"
+    validate_certs: false
+    status_code: [200, 301, 302, 401]
+  register: ts_up3
+  retries: 30
+  delay: 5
+  until: ts_up3.status in [200, 301, 302, 401]
+  when: socks_sweep.changed or callback_prune.changed
+
+- name: Start the http + poseidon service containers
+  ansible.builtin.command:
+    cmd: ./mythic-cli start {{ mythic_c2_profile }} {{ mythic_agent }}
+    chdir: "{{ mythic_install_dir }}"
+  become: true
+  changed_when: true
+
+# --- beachhead implant ---------------------------------------------------
+- name: Build the beachhead payload via the jupyter scripting client
+  ansible.builtin.command:
+    cmd: >-
+      docker exec mythic_jupyter python3 /tmp/provision_mythic.py build
+      --server {{ mythic_internal_host }} --port {{ mythic_server_port }}
+      --user {{ mythic_operator_user }} --password {{ mythic_operator_password }}
+      --agent {{ mythic_agent }} --profile {{ mythic_c2_profile }}
+      --callback-host {{ mythic_beachhead_callback_host }}
+      --out /tmp/beachhead
+  args:
+    creates: "{{ mythic_beachhead_payload }}"
+  become: true
+
+- name: Copy the built payload out of jupyter to the host path
+  ansible.builtin.shell: |
+    docker cp mythic_jupyter:/tmp/beachhead {{ mythic_beachhead_payload }}
+    chmod +x {{ mythic_beachhead_payload }}
+  args:
+    creates: "{{ mythic_beachhead_payload }}"
+  become: true
+
+- name: Install the beachhead systemd service
+  ansible.builtin.template:
+    src: beachhead.service.j2
+    dest: /etc/systemd/system/nilgiri-beachhead.service
+    mode: "0644"
+  become: true
+  register: beachhead_unit
+
+- name: Enable + start the beachhead (re-checks-in after reverts)
+  ansible.builtin.systemd:
+    name: nilgiri-beachhead.service
+    enabled: true
+    daemon_reload: true
+    state: "{{ 'restarted' if beachhead_unit.changed else 'started' }}"
+  become: true
+
+# --- tag callback (m7.s1) + boot-time re-tagger --------------------------
+- name: Wait for the beachhead to check in, then tag the callback (m7.s1)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec mythic_jupyter python3 /tmp/provision_mythic.py tag-callback
+      --server {{ mythic_internal_host }} --port {{ mythic_server_port }}
+      --user {{ mythic_operator_user }} --password {{ mythic_operator_password }}
+      --description "{{ mythic_flags.m7_s1 }} (ws.alpha SMB account: svc_deploy)"
+  become: true
+  register: tag_cb
+  retries: 6
+  delay: 10
+  until: tag_cb.rc == 0
+  changed_when: "'tagged' in tag_cb.stdout"
+
+# After a revert the beachhead registers a new untagged callback, so re-apply
+# the tag on every boot.
+- name: Stage the boot-time re-tag script
+  ansible.builtin.template:
+    src: retag.sh.j2
+    dest: /opt/nilgiri/retag.sh
+    mode: "0755"
+  become: true
+
+- name: Install + enable the boot-time re-tagger (oneshot)
+  ansible.builtin.template:
+    src: retag.service.j2
+    dest: /etc/systemd/system/nilgiri-retag.service
+    mode: "0644"
+  become: true
+  register: retag_unit
+
+- name: Enable the re-tagger
+  ansible.builtin.systemd:
+    name: nilgiri-retag.service
+    enabled: true
+    daemon_reload: true
+  become: true
+
+- name: Show beachhead status
+  ansible.builtin.debug:
+    msg: "{{ tag_cb.stdout_lines | default([]) }}"

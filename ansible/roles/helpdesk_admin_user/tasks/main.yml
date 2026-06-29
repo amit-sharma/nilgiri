@@ -1,0 +1,33 @@
+---
+# helpdesk_admin_user (M4) -- create helpdesk.admin on dc1.charlie.
+# Only this user has Write rights to HKLM\SOFTWARE\Nilgiri\RelayWin on
+# fs.charlie (the M4 ntlmrelayx target).
+
+- name: Create the helpdesk.admin domain user
+  microsoft.ad.user:
+    name: "{{ helpdesk_admin_user_sam }}"
+    sam_account_name: "{{ helpdesk_admin_user_sam }}"
+    firstname: "{{ helpdesk_admin_user_firstname }}"
+    surname: "{{ helpdesk_admin_user_surname }}"
+    upn: "{{ helpdesk_admin_user_upn }}"
+    description: "{{ helpdesk_admin_user_description }}"
+    password: "{{ helpdesk_admin_user_password }}"
+    # on_create so re-runs don't invalidate the scheduled task's stored credential
+    update_password: on_create
+    password_never_expires: true
+    enabled: true
+    path: "{{ helpdesk_admin_user_path }}"
+    state: present
+
+# fs.charlie's registry-ACL role keys on this SID rather than the NTAccount
+# string (member-server name->SID translation can return stale LSA-cache values).
+- name: Capture helpdesk.admin SID for downstream roles
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory -ErrorAction Stop
+    (Get-ADUser -Identity '{{ helpdesk_admin_user_sam }}').SID.Value
+  register: helpdesk_admin_user_sid_result
+  changed_when: false
+
+- name: Publish helpdesk_admin_user_sid as a fact
+  ansible.builtin.set_fact:
+    helpdesk_admin_user_sid: "{{ helpdesk_admin_user_sid_result.stdout | trim }}"

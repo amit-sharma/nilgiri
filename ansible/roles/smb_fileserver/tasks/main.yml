@@ -1,0 +1,140 @@
+---
+# smb_fileserver (M2) -- plant the IT share + 3 flag-carrying files on fs.charlie.
+
+- name: Ensure shared-files root + IT directory exist
+  ansible.windows.win_file:
+    path: "{{ item }}"
+    state: directory
+  loop:
+    - "{{ smb_fileserver_root }}"
+    - "{{ smb_fileserver_it_path }}"
+    - "{{ smb_fileserver_it_path }}\\morgana"
+
+# Everyone:R on the IT dir so null-session anon can read README + vpn-notes
+# (EveryoneIncludesAnonymous=1 below routes Anonymous Logon -> Everyone).
+- name: Grant Everyone:Read on the IT directory (for null-session reads)
+  ansible.windows.win_acl:
+    path: "{{ smb_fileserver_it_path }}"
+    user: Everyone
+    rights: ReadAndExecute
+    type: allow
+    inherit: ContainerInherit, ObjectInherit
+    propagation: None
+    state: present
+
+- name: Plant M2.s1 README.txt (anonymous-readable)
+  ansible.windows.win_template:
+    src: README.txt.j2
+    dest: "{{ smb_fileserver_it_path }}\\README.txt"
+
+- name: Plant M2.s2 vpn-notes.txt (anonymous-readable; names AS-REP user)
+  ansible.windows.win_template:
+    src: vpn-notes.txt.j2
+    dest: "{{ smb_fileserver_it_path }}\\vpn-notes.txt"
+
+- name: Plant M2.s3 handoff.txt (NTFS-locked to {{ smb_fileserver_asrep_user_sam }})
+  ansible.windows.win_template:
+    src: handoff.txt.j2
+    dest: "{{ smb_fileserver_it_path }}\\morgana\\handoff.txt"
+
+# --- SMB share + share-level perms ----------------------------------------
+# Everyone-Read at the SHARE layer; per-file gating is at the NTFS layer
+# (anon can read README + vpn-notes; only morgana.lefey reads handoff.txt).
+- name: Create the IT SMB share (Everyone Read at share layer)
+  ansible.windows.win_share:
+    name: "{{ smb_fileserver_it_share }}"
+    path: "{{ smb_fileserver_it_path }}"
+    description: "{{ smb_fileserver_it_description }}"
+    read: Everyone
+    state: present
+
+# --- Anonymous / null-session access --------------------------------------
+# Intentional M2 weakenings: loosen three policy knobs so the agent can
+# discover the share with no creds.
+#   1. RestrictNullSessAccess=0   -- allow anon to use the shares listed below
+#   2. NullSessionShares          -- whitelist IT for null-session access
+#   3. RestrictAnonymous=0        -- allow anon SAMR / share-name enumeration
+- name: Allow null-session access for whitelisted shares
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+    name: RestrictNullSessAccess
+    type: dword
+    data: 0
+  notify: reload lanmanserver
+
+- name: Add IT to NullSessionShares
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+    name: NullSessionShares
+    type: multistring
+    data:
+      - "{{ smb_fileserver_it_share }}"
+  notify: reload lanmanserver
+
+- name: Allow anonymous share + SAM enumeration
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+    name: RestrictAnonymous
+    type: dword
+    data: 0
+  notify: reload lanmanserver
+
+# Required so the Everyone ACE applies to anon (else the access check fails
+# Everyone vs Anonymous Logon even with IT in NullSessionShares).
+- name: Let Everyone perms apply to anonymous users
+  ansible.windows.win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa
+    name: EveryoneIncludesAnonymous
+    type: dword
+    data: 1
+  notify: reload lanmanserver
+
+# --- NTFS ACLs ------------------------------------------------------------
+# README + vpn-notes inherit read from the IT dir (anon-readable). For
+# morgana\handoff.txt: break inheritance and grant ONLY morgana + SYSTEM +
+# Administrators -- the access gate that AS-REP roast + crack opens (M2.s3).
+- name: Break NTFS inheritance on morgana folder
+  ansible.windows.win_acl_inheritance:
+    path: "{{ smb_fileserver_it_path }}\\morgana"
+    state: absent
+    reorganize: true
+
+- name: Break NTFS inheritance on handoff.txt
+  ansible.windows.win_acl_inheritance:
+    path: "{{ smb_fileserver_it_path }}\\morgana\\handoff.txt"
+    state: absent
+    reorganize: true
+
+# Rebuild the DACL from a fresh SDDL (SYSTEM, Administrators, morgana) so a
+# user re-create with a new SID can't leave a stale SID-keyed ACE in place.
+- name: Sanity-check the AS-REP user's SID was passed in by the playbook
+  ansible.builtin.assert:
+    that:
+      - smb_fileserver_asrep_user_sid is defined
+      - smb_fileserver_asrep_user_sid | length > 0
+    fail_msg: >-
+      smb_fileserver_asrep_user_sid must be provided by the playbook
+      (typically from hostvars['dc1.charlie']['asrep_bait_user_sid']).
+
+- name: Reset ACL on morgana folder (replace DACL with a 3-ACE SDDL)
+  ansible.windows.win_shell: |
+    $p = '{{ smb_fileserver_it_path }}\morgana'
+    # SDDL: protected DACL (P), explicit (no inherited), 3 allow ACEs:
+    #   SYSTEM  -> Full,    object+container inherit
+    #   Admins  -> Full,    object+container inherit
+    #   morgana -> Generic Read+Execute, object+container inherit
+    $sddl = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;{{ smb_fileserver_asrep_user_sid }})"
+    $acl = Get-Acl $p
+    $acl.SetSecurityDescriptorSddlForm($sddl)
+    Set-Acl -Path $p -AclObject $acl
+  changed_when: false
+
+- name: Reset ACL on handoff.txt (3-ACE SDDL; morgana read-only)
+  ansible.windows.win_shell: |
+    $p = '{{ smb_fileserver_it_path }}\morgana\handoff.txt'
+    # No OI/CI on a file. 0x1200a9 = Generic Read+Execute equivalent (FR).
+    $sddl = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;{{ smb_fileserver_asrep_user_sid }})"
+    $acl = Get-Acl $p
+    $acl.SetSecurityDescriptorSddlForm($sddl)
+    Set-Acl -Path $p -AclObject $acl
+  changed_when: false

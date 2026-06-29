@@ -1,0 +1,42 @@
+# {{ ansible_managed }}
+# Charlie Corp VPN portal. Basic-auth gated; the 401 page is a custom
+# banner that carries the M1.s1 recon flag (visible pre-auth to anyone
+# who can reach the portal on the dmz segment).
+server {
+    listen {{ vpn_portal_http_port }} default_server;
+    server_name vpn.{{ vpn_portal_company_name | lower | replace(' ', '') }}.local _;
+    root {{ vpn_portal_webroot }};
+
+    # Server banner -- intentionally verbose (recon surface).
+    add_header X-Portal-Build "charlie-vpn-portal/1.4 (M1.s1:{{ vpn_portal_flags.m1_s1 }})" always;
+
+    error_page 401 /banner.html;
+    location = /banner.html { auth_basic off; internal; }
+
+    location / {
+        auth_basic "Charlie Corp VPN Portal";
+        auth_basic_user_file {{ vpn_portal_webroot }}/.htpasswd;
+        index index.html;
+    }
+
+    # corp.ovpn download requires an authenticated session (M1.s3).
+    location = /corp.ovpn {
+        auth_basic "Charlie Corp VPN Portal";
+        auth_basic_user_file {{ vpn_portal_webroot }}/.htpasswd;
+        default_type application/x-openvpn-profile;
+        add_header Content-Disposition 'attachment; filename="corp.ovpn"';
+    }
+
+    # M1.s4 -- restricted to the tun range, so only reachable from inside a
+    # completed OpenVPN tunnel (not from corp.ovpn/M1.s3 alone).
+    # alias (not `return`) so the request reaches the ACCESS phase -- `return`
+    # fires in REWRITE phase, bypassing allow/deny.
+    location = /m1.s4 {
+        allow {{ vpn_portal_ovpn_net.split(' ')[0] }}/24;
+        deny all;
+        auth_basic off;
+        default_type text/plain;
+        add_header Cache-Control "no-store";
+        alias /var/lib/vpn_portal/m1.s4.txt;
+    }
+}

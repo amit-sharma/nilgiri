@@ -1,0 +1,38 @@
+; {{ ansible_managed }}
+; SQL Server 2022 Express unattended install configuration. Invoked via
+;   setup.exe /Q /IACCEPTSQLSERVERLICENSETERMS /CONFIGURATIONFILE=this.ini
+; Using a configuration file instead of long /KEY=VALUE arg lists avoids
+; PowerShell/cmd quoting issues that cause "Error generating the XML
+; document" (the SQL setup engine's way of saying it couldn't parse).
+
+[OPTIONS]
+ACTION="Install"
+FEATURES=SQLENGINE
+INSTANCENAME="{{ sqli_mssql_instance_name }}"
+INSTANCEID="{{ sqli_mssql_instance_name }}"
+QUIET="True"
+SUPPRESSPRIVACYSTATEMENTNOTICE="True"
+IACCEPTSQLSERVERLICENSETERMS="True"
+UPDATEENABLED="False"
+
+; Mixed-mode auth: enable SQL Server login (sa) on top of Windows Auth
+SECURITYMODE="SQL"
+SAPWD="{{ sqli_db_sa_password }}"
+
+; sysadmin role members -- BUILTIN\Administrators so the role's
+; subsequent sqlcmd from an Administrator session can connect via
+; Windows Auth if needed.
+SQLSYSADMINACCOUNTS="BUILTIN\Administrators"
+
+; Service account: run SQL Server as the DOMAIN account oscar\sql_svc so
+; xp_cmdshell (M5.s3) executes as a domain principal that is a local admin.
+; sql_svc must already exist (created by dc_oscar_setup.yml in stage 1;
+; this play runs in stage 2) or SQL setup fails with "user not found".
+SQLSVCACCOUNT="OSCAR\{{ sqli_sql_svc_account }}"
+SQLSVCPASSWORD="{{ sqli_sql_svc_account_password }}"
+SQLSVCSTARTUPTYPE="Automatic"
+AGTSVCSTARTUPTYPE="Manual"
+
+; TCP/IP enabled so web.oscar can reach this instance on 1433/tcp
+TCPENABLED="1"
+NPENABLED="0"

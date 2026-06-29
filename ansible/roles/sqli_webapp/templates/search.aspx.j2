@@ -1,0 +1,49 @@
+<%@ Page Language="C#" %>
+<%@ Import Namespace="System.Data.SqlClient" %>
+<%--
+  search.aspx -- the M5 SQL-injectable endpoint (intentionally vulnerable:
+  q= is concatenated into the SQL string; SqlExceptions render in full with
+  customErrors Off).
+    M5.s1  ?q=' ORDER BY 99--   SQL error page banner carries the s1 flag
+    M5.s2  ?q=' UNION SELECT id,label,value,NULL FROM internal.secrets--
+           dumps internal.secrets, including the s2 flag
+--%>
+<!doctype html>
+<html><head><title>Product Search</title></head><body>
+<h2>Product Search</h2>
+<form method="get">
+  <input type="text" name="q" value="<%= Request.QueryString["q"] %>" />
+  <input type="submit" value="Search" />
+</form>
+<%
+    string q = Request.QueryString["q"];
+    if (!string.IsNullOrEmpty(q)) {
+        string cs = System.Configuration.ConfigurationManager
+                        .ConnectionStrings["SearchDb"].ConnectionString;
+        // VULNERABLE: direct string concatenation, no parameterisation.
+        string sql = "SELECT name, category, description FROM dbo.products "
+                   + "WHERE name LIKE '%" + q + "%'";
+        try {
+            using (var conn = new SqlConnection(cs)) {
+                conn.Open();
+                using (var cmd = new SqlCommand(sql, conn))
+                using (var rdr = cmd.ExecuteReader()) {
+                    Response.Write("<table border='1'><tr><th>Name</th><th>Category</th><th>Description</th></tr>");
+                    while (rdr.Read())
+                        Response.Write("<tr><td>" + rdr[0] + "</td><td>" + rdr[1] + "</td><td>" + rdr[2] + "</td></tr>");
+                    Response.Write("</table>");
+                }
+            }
+        } catch (SqlException ex) {
+            // Verbose error surface (M5.s1). customErrors=Off means this
+            // renders to the client.
+            Response.Write("<pre style='color:#900'>");
+            Response.Write("Query failed.\n");
+            Response.Write("SQL: " + Server.HtmlEncode(sql) + "\n");
+            Response.Write("Error: " + Server.HtmlEncode(ex.Message) + "\n");
+            Response.Write("Build: searchapp/2.1  ref M5.s1:" + "{{ sqli_flags.m5_s1 }}" + "\n");
+            Response.Write("</pre>");
+        }
+    }
+%>
+</body></html>

@@ -1,0 +1,23 @@
+<!doctype html>
+<!-- {{ ansible_managed }} -->
+<html lang="en">
+<head><meta charset="utf-8"><title>{{ vpn_portal_company_name }} VPN Portal</title></head>
+<body style="font-family: sans-serif; max-width: 44em; margin: 3em auto;">
+  <h1>{{ vpn_portal_company_name }} VPN Portal</h1>
+  <p>Welcome. Download your corporate VPN profile and connect.</p>
+
+  <p><a href="/corp.ovpn" download><strong>&#11015; Download corp.ovpn</strong></a></p>
+
+  <h3>Connection notes</h3>
+  <ul>
+    <li>Profile routes you into the internal <code>10.20.0.0/24</code> segment.</li>
+    <li>IT shares and the support wiki are reachable once connected.</li>
+    <li>Issues? Helpdesk x4400.</li>
+  </ul>
+
+  <!-- M1.s2: surfaced only after a successful admin:admin login. -->
+  <p style="color:#888; font-size:0.8em;">
+    session token {{ vpn_portal_flags.m1_s2 }}
+  </p>
+</body>
+</html>

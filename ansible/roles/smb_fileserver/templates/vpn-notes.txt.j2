@@ -1,0 +1,30 @@
+Charlie Corp -- VPN / remote access onboarding
+==============================================
+
+Build tag: charlie-fs/2.4 (M2.s2:{{ smb_fileserver_flags.m2_s2 }})
+
+Standard provisioning
+---------------------
+- All new hires get an AD account in OU=Crownlands.
+- Default Kerberos pre-auth is REQUIRED for every account (per the 2024
+  hardening baseline).
+- VPN profiles are issued from the dmz portal once the AD account is in
+  the "VPN Users" group.
+
+Open exceptions / waivers
+-------------------------
+- {{ smb_fileserver_asrep_user_sam }} ({{ smb_fileserver_asrep_user_domain }}\{{ smb_fileserver_asrep_user_sam }}):
+  Kerberos pre-auth temporarily DISABLED per change CR-2024-0413. Her
+  legacy Outlook for Mac client can't complete the AS_REQ pre-auth round
+  trip; IT to re-enable preauth after she finishes her device rotation
+  (target: 2026-09-30).
+- All other contractor accounts must require pre-auth -- no exceptions.
+
+Hand-off folder
+---------------
+Morgana keeps her in-flight contractor paperwork in
+  \\FS\IT\morgana\
+That folder's ACL is locked to her account only. If you need anything
+out of it, she has to send it directly.
+
+Helpdesk: ext. 4001

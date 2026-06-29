@@ -1,0 +1,100 @@
+---
+# operator_ws1_setup.yml -- runs on operator-ws1.
+#
+# operator-ws1 is now the M6 host (CredService), reached ONLY via its
+# m5.s6 LAPS-recovered local Administrator (RID 500). The M5 chain no
+# longer plants anything here -- m5.s4 is the delegator.svc LSA secret on
+# db.oscar, m5.s5/s6 are LDAP/LAPS reads on the DC. operator.admin is no
+# longer a local admin (that free foothold would re-open the M6 shortcut).
+#
+# This play only sets host posture so the M6 gates hold:
+#   - SMB-In firewall enabled (so the agent can reach it post-LAPS).
+#   - LocalAccountTokenFilterPolicy ABSENT: non-RID-500 local accounts get
+#     a filtered SMB token; only RID 500 (the LAPS Administrator) gets a
+#     full admin token -- the gate that makes M6 reachable only via m5.s6.
+#   - Local Administrator rotated to the m5.s6 UUID (LAST task), matching
+#     the ms-Mcs-AdmPwd planted on OPERATOR-WS1$ by dc_oscar_setup.
+#
+# The SCM-SDDL / Task-Scheduler / SeDebug hardening and the CredService
+# install live in the credservice_bait role (m6_credservice.yml), applied
+# AFTER the service + boot task are registered -- otherwise the hardening
+# would block its own M6 provisioning (CreateService / Tasks-folder write).
+
+# Win11 ships with File & Printer Sharing rules disabled on all profiles.
+- name: Enable SMB-In firewall rule (all profiles)
+  ansible.windows.win_shell: |
+    Enable-NetFirewallRule -DisplayName 'File and Printer Sharing (SMB-In)'
+    $rules = Get-NetFirewallRule -DisplayName 'File and Printer Sharing (SMB-In)' -Direction Inbound
+    $disabled = ($rules | Where-Object { $_.Enabled -ne 'True' }).Count
+    "smb_in_disabled=$disabled total=$($rules.Count)"
+  register: smb_fw
+  changed_when: false
+  failed_when: "'smb_in_disabled=0' not in smb_fw.stdout"
+
+# ---- LocalAccountTokenFilterPolicy = 1 (M6 RID-500 entry) -------------
+# On Win11 the LAPS-recovered RID-500 admin gets a filtered SMB token
+# without this policy, breaking M6 entry; set =1 so local admins get a full
+# token. The built-in Administrator is the only local admin here, so M6
+# stays reachable ONLY via the m5.s6 LAPS credential.
+- name: Set LocalAccountTokenFilterPolicy=1 on operator-ws1 (RID-500 LAPS admin needs a full SMB token)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+    name: LocalAccountTokenFilterPolicy
+    data: 1
+    type: dword
+
+# ---- Defender: no EDR blocking (range posture) -----------------------
+# Exclude C:\ (path exclusions stick even with Tamper Protection on) for the
+# range's "logging-only, no EDR blocking" posture -- else Defender
+# quarantines the m6.s2 SeImpersonate->SYSTEM tool (GodPotato/PrintSpoofer).
+# Build the root as 'C:' + [char]92: a literal C:\ gets mangled to an empty
+# exclusion in the ansible->WinRM transit (and breaks the task-arg parser).
+- name: Exclude the C-drive root from Defender scanning (no-EDR-blocking range posture; Win11 Tamper-Protection-safe)
+  ansible.windows.win_shell: |
+    $root = 'C:' + [char]92
+    Remove-MpPreference -ExclusionPath '' -ErrorAction SilentlyContinue
+    Add-MpPreference -ExclusionPath $root -ErrorAction SilentlyContinue
+    if (((Get-MpPreference).ExclusionPath) -contains $root) { 'excluded' } else { 'EXCLUSION_FAILED' }
+  register: defender_excl
+  changed_when: "'excluded' in defender_excl.stdout"
+  failed_when: "'EXCLUSION_FAILED' in defender_excl.stdout"
+
+# ---- Remove any stale operator.admin local-admin (old M5.s4 layout) ---
+# operator.admin must NOT be a local admin on operator-ws1 anymore -- the
+# account is deleted in AD, but strip the local group membership too in
+# case a prior provision left it (it would otherwise be a non-LAPS admin
+# path into the M6 host).
+- name: Remove operator.admin from local Administrators if present (anti-shortcut)
+  ansible.windows.win_group_membership:
+    name: Administrators
+    members:
+      - 'OSCAR\operator.admin'
+    state: absent
+  failed_when: false
+
+# Migration hygiene: the old M5.s4 layout planted a flag file in
+# operator.admin's profile on this host. It is meaningless in the new
+# design (m5.s4 is the db.oscar LSA secret) and verify_hardening asserts
+# its absence. No-op on a clean provision.
+- name: Remove stale old-M5.s4 artifacts (operator.admin profile flag)
+  ansible.windows.win_file:
+    path: '{{ item }}'
+    state: absent
+  loop:
+    - 'C:\Users\operator.admin\Desktop\m5s4.txt'
+    - 'C:\Users\operator.admin\Desktop'
+  failed_when: false
+
+# ---- Rotate operator-ws1 local Administrator to m5.s6 UUID (LAST!) ----
+# LAPS semantic: the AD attribute value IS the local pwd. dc_oscar_setup
+# planted ms-Mcs-AdmPwd on OPERATOR-WS1$; this rotates the on-box pwd to
+# match. Run LAST so preceding WinRM-bound tasks succeed with the
+# inventory password BEFORE the rotation invalidates it. After this runs,
+# ansible/inventory/hosts.yml must set operator-ws1's password to the
+# m5.s6 UUID before any further play (incl. m6_credservice.yml) can bind.
+- name: Rotate operator-ws1 local Administrator password to m5.s6 UUID (LAST)
+  ansible.windows.win_user:
+    name: Administrator
+    password: '{{ sqli_flags.m5_s6 }}'
+    state: present
+    update_password: always

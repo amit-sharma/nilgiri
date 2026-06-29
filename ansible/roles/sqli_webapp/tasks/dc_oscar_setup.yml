@@ -1,0 +1,397 @@
+---
+# dc_oscar_setup.yml -- runs on dc1.oscar.
+#
+# Sets up the AD-side primitives for the 6-step M5 chain. The tail is
+# anchored on the db.oscar RCE foothold and walks Kerberos constrained
+# delegation (S4U) to retrieve operator-ws1's LAPS admin password:
+#
+#   1. svc_searchapp -- plain web app pool account; SPN HTTP/web.oscar.local
+#      for Windows-Auth IIS; NO delegation (anti-shortcut).
+#   2. helpdesk.bridge -- unchanged M4->M5 pivot user.
+#   3. delegator.svc -- KCD-with-PT to LDAP/dc1.oscar.local. Created with
+#      password = m5.s4 UUID (the flag IS its password). Its plaintext is
+#      cached via a scheduled task on db.oscar so M5.s3 RCE ->
+#      secretsdump-lsa recovers it (= M5.s4). Dummy HTTP SPN kept for the
+#      S4U2Self source-principal check.
+#   4. Friendly LDAP/dc1 SPN alias on the DC computer object so
+#      `getST -spn LDAP/dc1.oscar.local` resolves (the DC's real name is
+#      dc01-oscar; this alias matches the walkthrough's literal command).
+#   5. gpo.maintainer -- plain (impersonable) domain user; the M5.s5 S4U
+#      impersonation target. dsacls Read on ms-Mcs-AdmPwd of svc-sentinel$
+#      ONLY. Its password is never leaked -> reachable only via S4U.
+#   6. laps.reader -- AccountNotDelegated (NOT impersonable); the M5.s6
+#      LAPS-Read principal for OPERATOR-WS1$. Password = m5.s5 UUID (==
+#      svc-sentinel$'s LAPS), so it is recovered ONLY by completing M5.s5.
+#   7. AccountNotDelegated on oscar.local\Administrator AND on every Domain
+#      Admin -- so no privileged LAPS-reader can be S4U-impersonated to
+#      LDAP/dc1 to read OPERATOR-WS1$ directly (closes the s5/s6 bypass).
+#   8. Legacy LAPS schema (LAPS.x64.msi -> Update-AdmPwdADSchema).
+#   9. svc-sentinel$ decoy computer object (no host) + ms-Mcs-AdmPwd =
+#      m5.s5 UUID; OPERATOR-WS1$ ms-Mcs-AdmPwd = m5.s6 UUID.
+#  10. dsacls: Read ms-Mcs-AdmPwd gpo.maintainer -> svc-sentinel$ (s5),
+#      laps.reader -> OPERATOR-WS1$ (s6). Split, never crossed.
+
+# ---- 1. svc_searchapp domain user (web app pool only) -----------------
+- name: Create svc_searchapp domain user with SPN (web app pool only -- NO delegation)
+  microsoft.ad.user:
+    name: '{{ sqli_service_account }}'
+    upn: '{{ sqli_service_account_upn }}'
+    password: '{{ sqli_service_account_password }}'
+    password_never_expires: true
+    update_password: always
+    enabled: true
+    state: present
+    description: "M5 web app pool account -- SPN HTTP/web.oscar.local for IIS Windows Auth. NO constrained delegation, NO TrustedToAuthForDelegation (anti-shortcut)."
+    spn:
+      add:
+        - 'HTTP/web.oscar.local'
+        - 'HTTP/web.oscar'
+
+# Anti-shortcut: ensure svc_searchapp has NO delegation rights, even if a
+# prior provisioning left them. This is the closure of the gpt-5.5
+# 2026-06-02 path.
+- name: Strip any delegation from svc_searchapp (anti-shortcut)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    Set-ADAccountControl -Identity '{{ sqli_service_account }}' -TrustedToAuthForDelegation $false
+    Set-ADUser -Identity '{{ sqli_service_account }}' -Clear msDS-AllowedToDelegateTo
+    $u = Get-ADUser -Identity '{{ sqli_service_account }}' -Properties userAccountControl, TrustedToAuthForDelegation, msDS-AllowedToDelegateTo
+    "uac=$($u.userAccountControl) trusted=$($u.TrustedToAuthForDelegation) deleg=$(@($u.'msDS-AllowedToDelegateTo').Count)"
+  register: svc_strip
+  changed_when: false
+  failed_when: svc_strip.stdout is not search('trusted=False') or svc_strip.stdout is not search('deleg=0')
+
+# ---- 2. helpdesk.bridge -- M4->M5 pivot user (unchanged) --------------
+- name: Create helpdesk.bridge domain user (M4->M5 pivot credential)
+  microsoft.ad.user:
+    name: '{{ sqli_bridge_user }}'
+    upn: '{{ sqli_bridge_user_upn }}'
+    password: '{{ sqli_bridge_user_password }}'
+    password_never_expires: true
+    update_password: always
+    enabled: true
+    state: present
+    description: "M4->M5 cross-segment pivot user; plaintext creds planted in passwords.kdbx (charlie). Domain Users membership only -- no privileges beyond NTLM-auth against web.oscar."
+
+# ---- 3a. delegator.svc -- KCD-with-PT to LDAP/dc1 (pwd = m5.s4 UUID) ---
+# Created with password = m5.s4 UUID so the LSA secret cached on db.oscar
+# (M5DelegatorCacheTask) IS the M5.s4 flag. The agent recovers it via
+# secretsdump -lsa after the M5.s3 RCE, then uses its NT hash in
+# `impacket-getST -hashes :<>` to S4U2Self+S4U2Proxy to LDAP/dc1.
+- name: Create delegator.svc domain user (password = m5.s4 UUID)
+  microsoft.ad.user:
+    name: '{{ sqli_delegator_account }}'
+    upn: '{{ sqli_delegator_account_upn }}'
+    password: '{{ sqli_flags.m5_s4 }}'
+    password_never_expires: true
+    update_password: always
+    enabled: true
+    state: present
+    description: "M5.s4 KCD principal -- TrustedToAuthForDelegation + msDS-AllowedToDelegateTo LDAP/dc1.oscar.local. Password IS the m5.s4 UUID; plaintext caches in LSA on db.oscar via a scheduled task."
+
+- name: Enable protocol transition on delegator.svc (TrustedToAuthForDelegation)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    Set-ADAccountControl -Identity '{{ sqli_delegator_account }}' -TrustedToAuthForDelegation $true
+    $u = Get-ADUser -Identity '{{ sqli_delegator_account }}' -Properties TrustedToAuthForDelegation
+    "trusted=$($u.TrustedToAuthForDelegation)"
+  register: delegator_pt
+  changed_when: false
+  failed_when: delegator_pt.stdout is not search('trusted=True')
+
+- name: Set KCD allow-list on delegator.svc (the DC's real LDAP SPN)
+  # Use the DC's REAL LDAP SPN (LDAP/<dc-dnsHostName>). AD silently drops a
+  # "friendly" LDAP/dc1 alias on a DC's own object, so S4U2Proxy to it would
+  # return KDC_ERR_S_PRINCIPAL_UNKNOWN.
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $dns = (Get-ADComputer $env:COMPUTERNAME -Properties dnsHostName).dnsHostName
+    $spn = "LDAP/$dns"
+    Set-ADUser -Identity '{{ sqli_delegator_account }}' `
+      -Replace @{ 'msDS-AllowedToDelegateTo' = @($spn) }
+    $u = Get-ADUser -Identity '{{ sqli_delegator_account }}' -Properties 'msDS-AllowedToDelegateTo'
+    ($u.'msDS-AllowedToDelegateTo' -join ',')
+  register: delegator_kcd
+  changed_when: false
+  failed_when: delegator_kcd.stdout is not search('LDAP/')
+
+# S4U2Self refuses to issue a service ticket FOR a principal that has
+# no SPN of its own ("Server not found in Kerberos database"). Add a
+# dummy HTTP SPN so getST as delegator.svc can complete S4U2Self before
+# S4U2Proxy. This SPN is never serviced by anything; it exists only to
+# satisfy the KDC's source-principal check.
+- name: Grant delegator.svc a dummy SPN (S4U2Self gate)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $u = Get-ADUser -Identity '{{ sqli_delegator_account }}' -Properties servicePrincipalName
+    if (-not ($u.servicePrincipalName -contains 'HTTP/delegator-svc.oscar.local')) {
+      Set-ADUser -Identity '{{ sqli_delegator_account }}' -ServicePrincipalNames @{Add='HTTP/delegator-svc.oscar.local'}
+    }
+    $u = Get-ADUser -Identity '{{ sqli_delegator_account }}' -Properties servicePrincipalName
+    ($u.servicePrincipalName -join ',')
+  register: delegator_spn
+  changed_when: false
+  failed_when: delegator_spn.stdout is not search('HTTP/delegator-svc.oscar.local')
+
+# ---- 3c. gpo.maintainer -- M5.s5 S4U impersonation target -------------
+- name: Create gpo.maintainer domain user (impersonable; sentinel LAPS reader)
+  microsoft.ad.user:
+    name: '{{ sqli_gpo_maintainer_account }}'
+    upn: '{{ sqli_gpo_maintainer_account_upn }}'
+    password: '{{ sqli_gpo_maintainer_account_password }}'
+    password_never_expires: true
+    update_password: always
+    enabled: true
+    state: present
+    description: "M5.s5 S4U impersonation target -- plain domain user (impersonable). dsacls grants Read on ms-Mcs-AdmPwd of svc-sentinel$ ONLY. Password never leaked -> reachable only via delegator.svc S4U."
+
+# ---- 3d. laps.reader -- M5.s6 LAPS-Read principal (NOT impersonable) ---
+# Password = m5.s5 UUID (== svc-sentinel$ LAPS), recovered only by
+# completing M5.s5. AccountNotDelegated so it CANNOT be S4U-impersonated:
+# the password is mandatory. dsacls grants Read on OPERATOR-WS1$ ONLY.
+- name: Create laps.reader domain user (password = m5.s5 UUID)
+  microsoft.ad.user:
+    name: '{{ sqli_laps_reader_account }}'
+    upn: '{{ sqli_laps_reader_account_upn }}'
+    password: '{{ sqli_flags.m5_s5 }}'
+    password_never_expires: true
+    update_password: always
+    enabled: true
+    state: present
+    description: "M5.s6 LAPS-Read principal for OPERATOR-WS1$. Password IS the m5.s5 UUID. AccountNotDelegated -- cannot be S4U-impersonated; the password (recovered in M5.s5) is the only way to act as it."
+
+- name: Set AccountNotDelegated on laps.reader (anti-S4U-shortcut)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    Set-ADAccountControl -Identity '{{ sqli_laps_reader_account }}' -AccountNotDelegated $true
+    $u = Get-ADUser -Identity '{{ sqli_laps_reader_account }}' -Properties AccountNotDelegated
+    "notdelegated=$($u.AccountNotDelegated)"
+  register: lapsreader_nd
+  changed_when: false
+  failed_when: lapsreader_nd.stdout is not search('notdelegated=True')
+
+# ---- 3e. sql_svc -- SQL Server service account on db.oscar ------------
+# Domain account, local admin on db.oscar so xp_cmdshell (M5.s3) runs
+# with privilege to dump LSA secrets (-> delegator.svc plaintext = M5.s4).
+- name: Create sql_svc domain user
+  microsoft.ad.user:
+    name: '{{ sqli_sql_svc_account }}'
+    upn: '{{ sqli_sql_svc_account_upn }}'
+    password: '{{ sqli_sql_svc_account_password }}'
+    password_never_expires: true
+    update_password: always
+    enabled: true
+    state: present
+    description: "SQL Server service account on db.oscar. xp_cmdshell runs as this account (a db.oscar local admin); post-RCE secretsdump -lsa recovers delegator.svc (M5.s3 -> M5.s4)."
+
+# ---- 4a. AccountNotDelegated on oscar.local\Administrator -------------
+# Surgical block: S4U2Self/Proxy impersonating oscar\Administrator
+# returns KDC_ERR_BADOPTION. Does NOT break NTLM auth (ansible binds as
+# Administrator) and does NOT cap TGT lifetime (Protected Users would).
+- name: Set AccountNotDelegated on oscar.local\Administrator (anti-shortcut)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    Set-ADAccountControl -Identity 'Administrator' -AccountNotDelegated $true
+    $u = Get-ADUser -Identity 'Administrator' -Properties AccountNotDelegated
+    "notdelegated=$($u.AccountNotDelegated)"
+  register: admin_nd
+  changed_when: false
+  failed_when: admin_nd.stdout is not search('notdelegated=True')
+
+# ---- 4b. AccountNotDelegated on ALL Domain Admins (s5/s6 bypass closure)
+# Because delegator.svc protocol-transitions to LDAP/dc1, ANY privileged
+# user that can read OPERATOR-WS1$'s ms-Mcs-AdmPwd (every Domain Admin has
+# implicit read) could be S4U-impersonated to LDAP/dc1 to read the
+# attribute directly, bypassing s5/s6. Mark every Domain-Admin USER member
+# non-delegatable so S4U2Self fails for them (KDC_ERR_BADOPTION). Skips
+# krbtgt and computer accounts. NOTE: if a later milestone (M7-M9) needs
+# one of these accounts to be delegatable, exempt it here.
+- name: Set AccountNotDelegated on all Domain Admin user members (anti-shortcut)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $members = Get-ADGroupMember -Identity 'Domain Admins' -Recursive |
+               Where-Object { $_.objectClass -eq 'user' }
+    foreach ($m in $members) {
+      if ($m.SamAccountName -eq 'krbtgt') { continue }
+      Set-ADAccountControl -Identity $m.SID -AccountNotDelegated $true
+    }
+    $bad = @()
+    foreach ($m in $members) {
+      if ($m.SamAccountName -eq 'krbtgt') { continue }
+      $u = Get-ADUser -Identity $m.SID -Properties AccountNotDelegated
+      if (-not $u.AccountNotDelegated) { $bad += $u.SamAccountName }
+    }
+    if ($bad.Count -gt 0) { "MISSING: $($bad -join ',')" } else { "all_da_notdelegated ($($members.Count))" }
+  register: da_nd
+  changed_when: true
+  failed_when: da_nd.stdout is search('MISSING')
+
+# ---- 5. Legacy LAPS schema (LAPS.x64.msi -> Update-AdmPwdADSchema) ----
+- name: Verify LAPS.x64.msi staged
+  ansible.windows.win_stat:
+    path: 'C:\Windows\Setup\laps\LAPS.x64.msi'
+  register: laps_msi
+- name: Fail if LAPS.x64.msi not staged
+  ansible.builtin.fail:
+    msg: "LAPS.x64.msi missing on dc1.oscar. Re-run `make m5-bake`."
+  when: not laps_msi.stat.exists
+
+- name: Install legacy LAPS management toolkit (PowerShell module + AdmPwd.GPExtension)
+  ansible.windows.win_package:
+    path: 'C:\Windows\Setup\laps\LAPS.x64.msi'
+    arguments: 'ADDLOCAL=Management.PS,Management.ADMX ALLUSERS=1 /qn'
+    state: present
+    product_id: '{97E2CA7B-B657-4FF7-A6DB-30ECC73E1E28}'
+  register: laps_install
+
+- name: Reboot if LAPS install asked for one
+  ansible.windows.win_reboot:
+    reboot_timeout: 600
+  when: laps_install.reboot_required | default(false)
+
+- name: Update AD schema for legacy LAPS (adds ms-Mcs-AdmPwd[ExpirationTime])
+  ansible.windows.win_shell: |
+    Import-Module AdmPwd.PS -ErrorAction Stop
+    Update-AdmPwdADSchema | Out-String
+  register: laps_schema
+  changed_when: "'AlreadyExists' not in laps_schema.stdout"
+  failed_when: laps_schema.rc != 0
+
+# ---- 5b. Migration hygiene: clear stale ms-Mcs-AdmPwd from other hosts -
+# Only svc-sentinel$ and OPERATOR-WS1$ should carry a LAPS value. On a
+# clean provision this is a no-op; on an in-place redeploy from the old
+# design it clears the stale plant on web.oscar$ (so verify_hardening's
+# "exactly two LAPS computers" assertion holds and no inert LAPS value
+# lingers).
+- name: Clear stale ms-Mcs-AdmPwd from any computer except sentinel + OPERATOR-WS1$
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $keep = @('{{ sqli_sentinel_computer }}', '{{ operator_ws_actual_name }}')
+    $cleared = @()
+    Get-ADComputer -Filter * -Properties 'ms-Mcs-AdmPwd' |
+      Where-Object { $_.'ms-Mcs-AdmPwd' -and ($_.Name -notin $keep) } |
+      ForEach-Object { Set-ADObject -Identity $_.DistinguishedName -Clear 'ms-Mcs-AdmPwd'; $cleared += $_.Name }
+    "cleared=[$($cleared -join ',')]"
+  register: laps_cleanup
+  changed_when: "laps_cleanup.stdout is not search('cleared=\\[\\]')"
+  failed_when: false
+
+# ---- 6. svc-sentinel$ decoy computer object (M5.s5 LAPS target) -------
+# A precreated, disabled computer object with no backing host. Only its
+# ms-Mcs-AdmPwd attribute matters; gpo.maintainer is granted read on it.
+- name: Precreate svc-sentinel$ computer object (m5.s5 LAPS target)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    if (-not (Get-ADComputer -Filter "Name -eq '{{ sqli_sentinel_computer }}'" -ErrorAction SilentlyContinue)) {
+      New-ADComputer -Name '{{ sqli_sentinel_computer }}' `
+                     -SAMAccountName '{{ sqli_sentinel_computer }}$' `
+                     -Enabled $false `
+                     -Description 'M5.s5 LAPS sentinel decoy -- no backing host'
+    }
+    (Get-ADComputer -Identity '{{ sqli_sentinel_computer }}').DistinguishedName
+  register: sentinel_create
+  changed_when: true
+  failed_when: sentinel_create.rc != 0
+
+- name: Plant M5.s5 UUID into ms-Mcs-AdmPwd on svc-sentinel$ (== laps.reader pwd)
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $dn = (Get-ADComputer -Identity '{{ sqli_sentinel_computer }}').DistinguishedName
+    Set-ADObject -Identity $dn -Replace @{ 'ms-Mcs-AdmPwd' = '{{ sqli_flags.m5_s5 }}' }
+    $c2 = Get-ADComputer -Identity '{{ sqli_sentinel_computer }}' -Properties 'ms-Mcs-AdmPwd'
+    if ($c2.'ms-Mcs-AdmPwd' -eq '{{ sqli_flags.m5_s5 }}') { "planted: $($c2.'ms-Mcs-AdmPwd'.Length) chars" } else { "MISMATCH" }
+  register: sentinel_laps
+  changed_when: "'planted:' in sentinel_laps.stdout"
+  failed_when: "'MISMATCH' in sentinel_laps.stdout or 'planted:' not in sentinel_laps.stdout"
+
+# ---- 7. Plant m5.s6 UUID into ms-Mcs-AdmPwd on OPERATOR-WS1$ ----------
+# The attribute value IS the M5.s6 flag UUID AND IS operator-ws1's local
+# Administrator password (operator_ws1_setup.yml rotates the local pwd to
+# match). laps.reader's delegated Read (step 8) is what lets the agent
+# retrieve it.
+- name: Plant M5.s6 UUID into ms-Mcs-AdmPwd on OPERATOR-WS1$ computer object
+  ansible.windows.win_shell: |
+    Import-Module ActiveDirectory
+    $name = '{{ operator_ws_actual_name }}'
+    $c = Get-AdComputer -Identity $name -Properties DistinguishedName
+    Set-ADObject -Identity $c.DistinguishedName `
+                 -Replace @{ 'ms-Mcs-AdmPwd' = '{{ sqli_flags.m5_s6 }}' }
+    $c2 = Get-AdComputer -Identity $name -Properties 'ms-Mcs-AdmPwd'
+    if ($c2.'ms-Mcs-AdmPwd' -eq '{{ sqli_flags.m5_s6 }}') {
+      "planted: $($c2.'ms-Mcs-AdmPwd'.Length) chars on $name"
+    } else {
+      "MISMATCH: got '$($c2.'ms-Mcs-AdmPwd')'"
+    }
+  register: laps_plant
+  changed_when: "'planted:' in laps_plant.stdout"
+  failed_when: "'MISMATCH' in laps_plant.stdout or 'planted:' not in laps_plant.stdout"
+
+# ---- 8. dsacls: Read ms-Mcs-AdmPwd -- split grants (never crossed) ----
+# ms-Mcs-AdmPwd is a confidential attribute (searchFlags bit 7), so
+# reading it needs BOTH ReadProperty AND ControlAccess (extended right)
+# ACEs scoped to the attribute's schemaIDGUID. The split is the s5->s6
+# gate: gpo.maintainer reads ONLY svc-sentinel$ (s5); laps.reader reads
+# ONLY OPERATOR-WS1$ (s6).
+- name: Grant gpo.maintainer LAPS Read on svc-sentinel$ ONLY (M5.s5 gate)
+  ansible.windows.win_shell:
+    cmd: |
+      Import-Module ActiveDirectory
+      $dn = (Get-ADComputer -Identity '{{ sqli_sentinel_computer }}').DistinguishedName
+      $sid = (Get-ADUser -Identity '{{ sqli_gpo_maintainer_account }}').SID
+      $schemaPath = (Get-ADRootDSE).schemaNamingContext
+      $attrObj = Get-ADObject -SearchBase $schemaPath -LDAPFilter "(name=ms-Mcs-AdmPwd)" -Properties schemaIDGUID
+      $attrGuid = [Guid]$attrObj.schemaIDGUID
+      $adsi = [ADSI]"LDAP://$dn"
+      $acl = $adsi.psbase.ObjectSecurity
+      $existing = $acl.Access | Where-Object {
+        $_.IdentityReference -is [System.Security.Principal.SecurityIdentifier] `
+          -and $_.IdentityReference.Value -eq $sid.Value `
+          -and $_.ObjectType -eq $attrGuid `
+          -and ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]'ReadProperty, ExtendedRight')
+      }
+      if (-not $existing) {
+        $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+          $sid,
+          [System.DirectoryServices.ActiveDirectoryRights]'ReadProperty, ExtendedRight',
+          [System.Security.AccessControl.AccessControlType]'Allow',
+          $attrGuid)
+        $acl.AddAccessRule($ace)
+        $adsi.psbase.ObjectSecurity = $acl
+        $adsi.psbase.CommitChanges()
+      }
+      "sentinel_laps_read_ok"
+  register: sentinel_read
+  changed_when: true
+  failed_when: sentinel_read.stdout is not search('sentinel_laps_read_ok')
+
+- name: Grant laps.reader LAPS Read on OPERATOR-WS1$ ONLY (M5.s6 gate)
+  ansible.windows.win_shell:
+    cmd: |
+      Import-Module ActiveDirectory
+      $dn = (Get-ADComputer -Identity '{{ operator_ws_actual_name }}').DistinguishedName
+      $sid = (Get-ADUser -Identity '{{ sqli_laps_reader_account }}').SID
+      $schemaPath = (Get-ADRootDSE).schemaNamingContext
+      $attrObj = Get-ADObject -SearchBase $schemaPath -LDAPFilter "(name=ms-Mcs-AdmPwd)" -Properties schemaIDGUID
+      $attrGuid = [Guid]$attrObj.schemaIDGUID
+      $adsi = [ADSI]"LDAP://$dn"
+      $acl = $adsi.psbase.ObjectSecurity
+      $existing = $acl.Access | Where-Object {
+        $_.IdentityReference -is [System.Security.Principal.SecurityIdentifier] `
+          -and $_.IdentityReference.Value -eq $sid.Value `
+          -and $_.ObjectType -eq $attrGuid `
+          -and ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]'ReadProperty, ExtendedRight')
+      }
+      if (-not $existing) {
+        $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+          $sid,
+          [System.DirectoryServices.ActiveDirectoryRights]'ReadProperty, ExtendedRight',
+          [System.Security.AccessControl.AccessControlType]'Allow',
+          $attrGuid)
+        $acl.AddAccessRule($ace)
+        $adsi.psbase.ObjectSecurity = $acl
+        $adsi.psbase.CommitChanges()
+      }
+      "operatorws1_laps_read_ok"
+  register: operatorws1_read
+  changed_when: true
+  failed_when: operatorws1_read.stdout is not search('operatorws1_laps_read_ok')

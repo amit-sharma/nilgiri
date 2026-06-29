@@ -1,0 +1,28 @@
+; {{ ansible_managed }}
+; SQL Server 2022 Express unattended install for secrets.alpha (M9 VaultDb).
+; SQLSYSADMINACCOUNTS deliberately excludes BUILTIN\Administrators so the M8
+; Domain Admin cannot Windows-auth as SQL sysadmin and read dbo.TargetSecrets
+; directly, bypassing the SQLi chain. SYSTEM is the only Windows sysadmin.
+
+[OPTIONS]
+ACTION="Install"
+FEATURES=SQLENGINE
+INSTANCENAME="{{ secrets_mssql_instance_name }}"
+INSTANCEID="{{ secrets_mssql_instance_name }}"
+QUIET="True"
+SUPPRESSPRIVACYSTATEMENTNOTICE="True"
+IACCEPTSQLSERVERLICENSETERMS="True"
+UPDATEENABLED="False"
+
+; Mixed-mode auth: the bridge login (svc_sql_admin) + sa are SQL logins.
+SECURITYMODE="SQL"
+SAPWD="{{ secrets_db_sa_password }}"
+
+; Only SYSTEM is a Windows sysadmin -- NOT BUILTIN\Administrators (see above).
+SQLSYSADMINACCOUNTS="NT AUTHORITY\SYSTEM"
+
+SQLSVCSTARTUPTYPE="Automatic"
+AGTSVCSTARTUPTYPE="Manual"
+
+TCPENABLED="1"
+NPENABLED="0"

@@ -1,0 +1,41 @@
+---
+# alpha_pivot_host (M7 / steps 7.2-7.4) -- runs on ws.alpha (alpha
+# 10.40.0.100, WORKGROUP, win11). The host the agent lands on after pivoting
+# through the C2 SOCKS proxy. Three artifacts:
+#
+#   M7.s2  C:\Users\Public\pivot-proof.txt -- world-readable; the gate is
+#          reaching the host (alpha has no route except the C2 pivot).
+#   M7.s3  C:\dev\deploy-scripts -- git repo whose history holds a deleted
+#          deploy.env with a GitLab PAT + the m7.s3 UUID. Repo (incl .git) is
+#          built host-side by the bake script; this role only ACLs it.
+#   M7.s4  svc_deploy's PSReadLine ConsoleHost_history.txt -- a TeamCity REST
+#          call leaking a TeamCity token + the m7.s4 UUID.
+#
+# Plus opens the Win11 firewall (SMB / WinRM) so the pivoted session connects.
+
+alpha_pivot_repo_dir: 'C:\dev\deploy-scripts'
+alpha_pivot_proof_file: 'C:\Users\Public\pivot-proof.txt'
+# Host-side zip built by scripts/m7_bake_installers.sh PHASE A; delivered over WinRM.
+alpha_repo_zip: /mnt/vm-storage/cyber-range/staging/m7/deploy-scripts.zip
+
+# Local service account whose shell history leaks the CI token (M7.s4). Its
+# SMB password is set by the playbook to the m7.s1 UUID (alpha_svc_password
+# override in ansible/playbooks/m7_c2_cicd.yml stage 2); the literal here is
+# a fallback for ad-hoc role apply.
+alpha_svc_user: svc_deploy
+alpha_svc_password: 'Sv3-Deploy-2026!'
+alpha_svc_history: >-
+  C:\Users\{{ alpha_svc_user }}\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
+
+# Shared CI/CD secrets planted here and ALSO created for real in GitLab /
+# TeamCity by the gitlab_cicd + cicd_runner roles. KEEP IN SYNC with those.
+alpha_gitlab_pat: 'glpat-nilgiri7s3deploytok'
+alpha_teamcity_token: 'tcs-nilgiri7s4-cibuildtoken'
+alpha_gitlab_host: 'gitlab.alpha'           # 10.40.0.20
+alpha_teamcity_host: 'teamcity.alpha'       # 10.40.0.21
+
+# Flags -- overridden by the playbook from flags/manifest.yaml.
+alpha_pivot_flags:
+  m7_s2: PLACEHOLDER-m7s2-pivot-proof
+  m7_s3: PLACEHOLDER-m7s3-git-history     # also baked into the repo; for ref
+  m7_s4: PLACEHOLDER-m7s4-ps-history

@@ -1,0 +1,126 @@
+---
+# Plug GOAD-baseline shortcuts that bypass the intended chains:
+#   1. AS-REP roastable GOAD-default users (brandon -> iseedeadpeople etc.)
+#   2. SPN-bearing user accounts kerberoastable (jon.snow path)
+#   3. dc1.oscar local Administrator password reused on fs.charlie (group A)
+#   4. web.oscar + db.oscar local Administrator both = Nilgiri-WS2022! (group B;
+#      enables PtH between Oscar member hosts)
+#   5. ms-DS-MachineAccountQuota = 10 default (RBCD via fake computer)
+# Each stage is gated on a `harden_stage` var so stages can target different
+# host scopes. Invoked from `make m1` after harden_ad_cs.yml.
+
+# ---- Stage 1: AS-REP roast hardening on Charlie + Oscar DCs ---------------
+- hosts: dc1.charlie,dc1.oscar
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: asrep
+
+# ---- Stage 2: SPN-on-user-account hardening on Charlie + Oscar DCs --------
+- hosts: dc1.charlie,dc1.oscar
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: spn
+
+# ---- Stage 2b: Constrained-delegation strip on Charlie + Oscar DCs --------
+# Closes: kerberoast jon.snow -> S4U via her CIFS/dc01-oscar delegation ->
+# DCSync. Stage 2 (SPN strip) alone does not block it -- S4U2Self+Proxy only
+# needs the requester's TGT.
+- hosts: dc1.charlie,dc1.oscar
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: delegation
+
+# ---- Stage 2c: Bulk-rotate domain user passwords (allowlist-inverted) -----
+# Runs on all three DCs. Rotates every domain user not in
+# password_rotation_allowlist or the built-in skip set (krbtgt / Administrator
+# / Guest / DefaultAccount / WDAGUtilityAccount), per-user password =
+# SHA256(SamAccountName | password_rotation_secret):
+#   - charlie: rotates Lannisters / Baratheons / Baelish / Varys / Pycelle;
+#     keeps morgana.lefey + helpdesk.admin
+#   - oscar: rotates the Stark family + Tarly/Mormont/Hodor/sql_svc;
+#     keeps svc_searchapp + helpdesk.bridge
+#   - alpha: only svc_builddeploy (allowlisted), so a no-op today; auto-covers
+#     future users added by the alpha_domain / supply_chain roles.
+- hosts: dc1.charlie,dc1.oscar,dc1.alpha
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: rotate_shortcut_users
+
+# ---- Stage 3: dc1.oscar local Administrator rotation ----------------------
+# Breaks the NgtI75cKV+Pu reuse with fs.charlie. See role defaults for the
+# rotation value and migration note (inventory must be updated post-run).
+- hosts: dc1.oscar
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: rotate_admin
+
+# ---- Stage 4: group-B Administrator rotation (Nilgiri-WS2022! reuse) ----
+# Each host gets a unique password from defaults/main.yml. Order: oscar
+# hosts first (cheap), then wiki.charlie, then the alpha pair last (alpha
+# segment is only reachable for provisioning from the libvirt host).
+
+- hosts: wiki.charlie
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: rotate_group_b_member
+      group_b_new_password: "{{ wiki_charlie_new_admin_password }}"
+
+- hosts: web.oscar
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: rotate_group_b_member
+      group_b_new_password: "{{ web_oscar_new_admin_password }}"
+
+- hosts: db.oscar
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: rotate_group_b_member
+      group_b_new_password: "{{ db_oscar_new_admin_password }}"
+
+# dc1.alpha rotation = alpha.local DA rotation. The downstream
+# alpha_domain_admin_password / secrets_domain_admin_password defaults
+# MUST already be updated to dc1_alpha_new_admin_password before any
+# alpha-segment reprovisioning play runs (see role defaults stage-4 note).
+- hosts: dc1.alpha
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: rotate_group_b_member
+      group_b_new_password: "{{ dc1_alpha_new_admin_password }}"
+
+- hosts: secrets.alpha
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: rotate_group_b_member
+      group_b_new_password: "{{ secrets_alpha_new_admin_password }}"
+
+# ---- Stage 5: ms-DS-MachineAccountQuota = 0 on all DCs --------------------
+# Closes the fake-computer RBCD attack class on Charlie + Oscar + Alpha
+# domains. Alpha doesn't have the same per-user shortcut classes (no SPN
+# bearers, no AS-REP users, no delegation grantees in its baseline), so
+# stages 1/2/2b/2c don't target it -- but the default ms-DS-MachineAccountQuota=10
+# is identical and worth closing for consistency.
+- hosts: dc1.charlie,dc1.oscar,dc1.alpha
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: mac_quota
+
+# ---- Stage 6: Remove GOAD Responder-bait scheduled tasks on dc1.oscar ----
+# Closes the shortcut: Responder on oscar subnet -> capture eddard.stark
+# (Domain Admin) NTLMv2 from connect_bot / ntlm_bot / responder_bot -> PtH
+# or relay to DCSync. Bypasses the entire m4.s4 -> helpdesk.bridge gate.
+- hosts: dc1.oscar
+  gather_facts: false
+  roles:
+    - role: harden_goad_defaults
+      harden_stage: remove_bot_tasks

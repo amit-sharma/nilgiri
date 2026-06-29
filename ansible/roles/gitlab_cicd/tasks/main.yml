@@ -1,0 +1,149 @@
+---
+# gitlab_cicd (M7) -- run GitLab CE in Docker and seed the CI/CD target.
+# Targets GitLab 17.x; if the pinned image changes, reconcile the rails
+# provisioning script and the runner-token retrieval.
+
+- name: Verify docker is available (baked in)
+  ansible.builtin.command: docker --version
+  changed_when: false
+
+- name: Verify the gitlab image was baked in
+  ansible.builtin.shell: "docker image inspect {{ gitlab_image }} >/dev/null 2>&1"
+  register: gl_img
+  changed_when: false
+  failed_when: gl_img.rc != 0
+
+- name: Create GitLab data directories
+  ansible.builtin.file:
+    path: "{{ gitlab_data_dir }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: [config, logs, data]
+  become: true
+
+# Idempotent run: only `docker run` if the container doesn't already exist.
+- name: Check for existing gitlab container
+  ansible.builtin.command: "docker ps -aq -f name=^/{{ gitlab_container }}$"
+  register: gl_ps
+  changed_when: false
+
+- name: Run GitLab CE container
+  # GITLAB_OMNIBUS_CONFIG overrides trim GitLab CE to fit this I/O-constrained
+  # VM (default config drowns Rails on first boot): single puma worker, 600s
+  # worker_timeout, prometheus_monitoring off, gitlab_kas off.
+  ansible.builtin.command:
+    cmd: >-
+      docker run --detach --name {{ gitlab_container }} --restart always
+      --hostname gitlab.alpha
+      --env GITLAB_OMNIBUS_CONFIG="external_url '{{ gitlab_external_url }}'; gitlab_rails['initial_root_password']='{{ gitlab_root_password }}'; puma['worker_processes']=1; puma['worker_timeout']=600; prometheus_monitoring['enable']=false; gitlab_kas['enable']=false;"
+      --publish {{ gitlab_http_port }}:80
+      --publish {{ gitlab_ssh_port }}:22
+      --volume {{ gitlab_data_dir }}/config:/etc/gitlab
+      --volume {{ gitlab_data_dir }}/logs:/var/log/gitlab
+      --volume {{ gitlab_data_dir }}/data:/var/opt/gitlab
+      --shm-size 256m
+      {{ gitlab_image }}
+  become: true
+  when: gl_ps.stdout == ""
+
+- name: Ensure gitlab container is started
+  ansible.builtin.command: "docker start {{ gitlab_container }}"
+  become: true
+  changed_when: false
+  when: gl_ps.stdout != ""
+
+# GitLab takes minutes to come up. Poll the readiness endpoint inside the
+# container (loopback, works fully isolated).
+- name: Wait for GitLab to report healthy
+  ansible.builtin.command:
+    cmd: "docker exec {{ gitlab_container }} curl -sf http://localhost/-/readiness"
+  become: true
+  register: gl_ready
+  retries: 60
+  delay: 10
+  until: gl_ready.rc == 0
+  changed_when: false
+
+# --- seed the project / variable / user / PAT ----------------------------
+- name: Stage the rails provisioning script
+  ansible.builtin.template:
+    src: gitlab_provision.rb.j2
+    dest: "{{ gitlab_data_dir }}/gitlab_provision.rb"
+    mode: "0640"
+  become: true
+
+# gitlab-rails runner executes as the `git` user; the docker-cp'd file lands
+# root:root 0644 by default but we chmod to be safe (a 0640 root file is
+# unreadable by git -> LoadError).
+- name: Copy provisioning script into the container + make it readable
+  ansible.builtin.shell: |
+    docker cp {{ gitlab_data_dir }}/gitlab_provision.rb {{ gitlab_container }}:/tmp/gitlab_provision.rb
+    docker exec {{ gitlab_container }} chmod 644 /tmp/gitlab_provision.rb
+  become: true
+  changed_when: false
+
+# Seeds group + project + .gitlab-ci.yml + masked DEPLOY_SECRET + automation
+# Developer + PAT + runner; writes the runner auth token to /tmp/runner_token.
+- name: Run the rails provisioning script (idempotent)
+  ansible.builtin.command:
+    cmd: "docker exec {{ gitlab_container }} gitlab-rails runner /tmp/gitlab_provision.rb"
+  become: true
+  register: gl_prov
+  changed_when: "'CREATED' in gl_prov.stdout"
+
+- name: Show provisioning output
+  ansible.builtin.debug:
+    var: gl_prov.stdout_lines
+
+- name: Extract the runner authentication token
+  ansible.builtin.command:
+    cmd: "docker exec {{ gitlab_container }} cat /tmp/runner_token"
+  become: true
+  register: runner_tok
+  changed_when: false
+
+# --- gitlab-runner (docker executor, ON gitlab.alpha) --------------------
+# Runs here (has Docker + streamed images). The runner user needs the docker
+# socket, so world-rw it (acceptable in this isolated lab). Job/helper images
+# use pull_policy=never (no egress); cache volumes disabled.
+- name: Make the docker socket accessible to the runner user
+  ansible.builtin.file:
+    path: /var/run/docker.sock
+    mode: "0666"
+  become: true
+
+- name: Create gitlab-runner config dir
+  ansible.builtin.file:
+    path: "{{ gitlab_runner_config_dir }}"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Render gitlab-runner config.toml (docker executor + helper image)
+  ansible.builtin.template:
+    src: runner-config.toml.j2
+    dest: "{{ gitlab_runner_config_dir }}/config.toml"
+    mode: "0644"
+  become: true
+  register: runner_cfg
+
+- name: Run the gitlab-runner container
+  ansible.builtin.shell: |
+    docker rm -f {{ gitlab_runner_container }} 2>/dev/null || true
+    docker run -d --name {{ gitlab_runner_container }} --restart always \
+      --add-host gitlab.alpha:10.40.0.20 \
+      -v {{ gitlab_runner_config_dir }}:/etc/gitlab-runner \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      {{ gitlab_runner_image }}
+  become: true
+  changed_when: true
+
+- name: Verify the runner registered
+  ansible.builtin.command: "docker exec {{ gitlab_runner_container }} gitlab-runner verify"
+  become: true
+  register: gr_verify
+  retries: 5
+  delay: 4
+  # gitlab-runner emits status on stderr, not stdout
+  until: "'is valid' in gr_verify.stdout or 'is valid' in gr_verify.stderr"
+  changed_when: false

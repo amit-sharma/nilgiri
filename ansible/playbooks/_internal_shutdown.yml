@@ -1,0 +1,11 @@
+---
+# Internal helper: graceful Windows shutdown via WinRM (clean NTFS journal
+# before virt-customize). Invoked by scripts/m4_bake_installers.sh; pass
+# target_hosts=... on the cmdline.
+- hosts: "{{ target_hosts | default('none') }}"
+  gather_facts: false
+  tasks:
+    - name: Issue Windows shutdown
+      ansible.windows.win_shell: "shutdown /s /t 0"
+      # shutdown closes WinRM mid-call; expect failure
+      failed_when: false

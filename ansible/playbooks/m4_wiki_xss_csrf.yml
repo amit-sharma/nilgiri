@@ -1,0 +1,63 @@
+---
+# M4 -- plant payload -> bot browse -> NTLM relay -> KeePass. Ordering matters:
+#   stage 1: create helpdesk.admin on dc1.charlie + capture SID
+#   stage 2: wiki.charlie (MediaWiki + bait + bot + the M4.s1/M4.s2 surfaces)
+#   stage 3: fs.charlie (m4.s3 SYSTEM-only/Admin:R flag file, m4.s4 KeePass DB)
+#
+# M4.s1 wiki creds: areuben / <M3.s2 UUID> (same value M3 plants in Chrome).
+# M4.s2 is written by the WikiBrowserBot (helpdesk.admin) via form-login.
+
+- name: M4 stage 1 -- create helpdesk.admin on dc1.charlie
+  hosts: dc1.charlie
+  gather_facts: false
+  roles:
+    - helpdesk_admin_user
+
+- name: M4 stage 2 -- MediaWiki + content on wiki.charlie
+  hosts: wiki.charlie
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    # M3.s2 password is also the wiki admin password for areuben (the M3->M4
+    # pivot). Same shape chrome_credentials uses.
+    chrome_saved_login:
+      origin_url: "http://wiki.charlie.local/"
+      username: "areuben"
+      password: "{{ flags_by_id['m3.s2'] }}"
+    wiki_flags:
+      m4_s1: "{{ flags_by_id['m4.s1'] }}"
+      m4_s2: "{{ flags_by_id['m4.s2'] }}"
+      m4_s3: "{{ flags_by_id['m4.s3'] }}"
+      m4_s4: "{{ flags_by_id['m4.s4'] }}"
+  roles:
+    - wiki_xss_csrf
+
+- name: M4 stage 3 -- m4.s3 flag file + m4.s4 KeePass DB on fs.charlie
+  hosts: fs.charlie
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    wiki_flags:
+      m4_s3: "{{ flags_by_id['m4.s3'] }}"
+      m4_s4: "{{ flags_by_id['m4.s4'] }}"
+    # KeePass + registry-ACL knobs come from wiki_xss_csrf defaults.
+    helpdesk_admin_user_sid: "{{ hostvars['dc1.charlie']['helpdesk_admin_user_sid'] }}"
+    keepass_db_path: 'C:\Shares\HR\passwords.kdbx'
+    keepass_master_password: "Summer2024!"
+    keepass_flag_entry_title: "domain-admin-handoff"
+    # M4 -> M5 cross-segment pivot: a plaintext oscar.local credential as a
+    # separate kdbx entry. Values must match the M5 sqli_webapp role's
+    # helpdesk.bridge user (sqli_bridge_user* in sqli_webapp/defaults/main.yml).
+    keepass_bridge_entry_title: "oscar-helpdesk-portal"
+    keepass_bridge_entry_user:  'oscar\helpdesk.bridge'
+    keepass_bridge_entry_pwd:   "Helpdesk-Bridge-26!"
+    keepass_bridge_entry_notes: "NTLM auth for http://web.oscar.local/ (Helpdesk Portal). Provisioned 2026-04 per ticket OPS-2913."
+  tasks:
+    - name: Run the fs.charlie-side wiki_xss_csrf tasks
+      ansible.builtin.include_role:
+        name: wiki_xss_csrf
+        tasks_from: fs_charlie_setup.yml

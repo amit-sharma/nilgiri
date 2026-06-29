@@ -1,0 +1,246 @@
+---
+# vpn_portal (M1) -- nginx portal + OpenVPN server on the dmz VM.
+
+# Best-effort: dmz is re-isolated post-provisioning. On a fresh rebuild,
+# temporarily NAT the dmz net before running this role.
+- name: Refresh apt cache (best-effort -- ok if dmz net is isolated)
+  ansible.builtin.apt:
+    update_cache: true
+  failed_when: false
+
+- name: Install portal + VPN packages
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - openvpn
+      - easy-rsa
+      - apache2-utils      # htpasswd
+    state: present
+
+# --- web portal ---------------------------------------------------------
+
+- name: Create portal webroot
+  ansible.builtin.file:
+    path: "{{ vpn_portal_webroot }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+
+- name: Render the post-login dashboard (embeds M1.s2 flag, links corp.ovpn)
+  ansible.builtin.template:
+    src: dashboard.html.j2
+    dest: "{{ vpn_portal_webroot }}/index.html"
+    owner: www-data
+    group: www-data
+    mode: "0644"
+
+# corp.ovpn is rendered later, after openvpn.yml builds the PKI and slurps
+# the client material into vpn_portal_client_material -- the template
+# inlines ca/cert/key/ta.key from that fact.
+
+- name: Create basic-auth file (admin:admin -- intentionally weak)
+  ansible.builtin.command:
+    cmd: "htpasswd -bc {{ vpn_portal_webroot }}/.htpasswd {{ vpn_portal_admin_user }} {{ vpn_portal_admin_password }}"
+    creates: "{{ vpn_portal_webroot }}/.htpasswd"
+
+- name: Ensure M1.s4 storage dir exists (served by nginx, ACL'd to tun)
+  ansible.builtin.file:
+    path: /var/lib/vpn_portal
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+
+- name: Plant M1.s4 flag for tun-restricted nginx location
+  ansible.builtin.copy:
+    content: "{{ vpn_portal_flags.m1_s4 }}\n"
+    dest: /var/lib/vpn_portal/m1.s4.txt
+    owner: www-data
+    group: www-data
+    mode: "0644"
+
+- name: Render nginx site (custom 401 banner carries M1.s1 flag)
+  ansible.builtin.template:
+    src: portal.nginx.conf.j2
+    dest: /etc/nginx/sites-available/portal
+    mode: "0644"
+  notify: reload nginx
+
+- name: Render the 401 banner page (M1.s1 -- visible pre-auth)
+  ansible.builtin.template:
+    src: banner.html.j2
+    dest: "{{ vpn_portal_webroot }}/banner.html"
+    owner: www-data
+    group: www-data
+    mode: "0644"
+
+- name: Enable portal site, disable default
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/portal
+    dest: /etc/nginx/sites-enabled/portal
+    state: link
+  notify: reload nginx
+
+- name: Disable nginx default site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx
+
+# --- OpenVPN ------------------------------------------------------------
+# PKI generation + server config is involved; split into its own file.
+- name: Configure OpenVPN server + PKI
+  ansible.builtin.include_tasks: openvpn.yml
+
+- name: Render corp.ovpn (carries M1.s3 flag in a comment; inlines PKI material)
+  ansible.builtin.template:
+    src: corp.ovpn.j2
+    dest: "{{ vpn_portal_webroot }}/corp.ovpn"
+    owner: www-data
+    group: www-data
+    mode: "0644"
+
+# Force a restart so server.conf changes take effect on existing servers.
+- name: Restart openvpn-server@server so push directives reload
+  ansible.builtin.systemd:
+    name: "openvpn-server@server"
+    state: restarted
+    enabled: true
+
+- name: Ensure nginx is enabled + running
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: true
+
+# --- Tunnel pivot (M1->M2 charlie + M4->M5 oscar) ----------------------
+# vpn-portal has extra NICs on both internal segments (10.20.0.5/24,
+# 10.30.0.5/24). Pivot needs: ip_forward=1, MASQUERADE out each segment NIC,
+# and explicit FORWARD ACCEPT both directions (pinned so a later hardening
+# pass doesn't break the pivot).
+- name: Enable IPv4 forwarding for tunnel pivot
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-vpn-portal-pivot.conf
+
+# Detect each segment-facing iface by route lookup rather than hardcoding
+# 'eth1'/'eth2' -- NetworkManager naming on Debian/kali is stable but
+# the index depends on NIC enumeration order.
+- name: Detect each segment-facing interface (by route lookup)
+  ansible.builtin.shell: |
+    set -eo pipefail
+    ip -o -4 route show {{ item.cidr }} | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -1
+  loop: "{{ vpn_portal_pivot_segments }}"
+  loop_control:
+    label: "{{ item.label }} ({{ item.cidr }})"
+  register: vpn_portal_iface_detect
+  changed_when: false
+
+- name: Assert every segment iface was found
+  ansible.builtin.assert:
+    that: item.stdout | length > 0
+    fail_msg: >-
+      No interface has a route to {{ item.item.cidr }} (segment
+      {{ item.item.label }}). Did vms.json's extra_nets land on this
+      VM? Check `virsh domiflist nilgiri-vpn-portal` and `ip -br addr`.
+  loop: "{{ vpn_portal_iface_detect.results }}"
+  loop_control:
+    label: "{{ item.item.label }} -> {{ item.stdout | default('MISSING') }}"
+
+- name: MASQUERADE OpenVPN tunnel traffic out each segment iface
+  ansible.builtin.iptables:
+    table: nat
+    chain: POSTROUTING
+    source: "{{ vpn_portal_ovpn_net.split(' ')[0] }}/24"
+    out_interface: "{{ item.stdout }}"
+    jump: MASQUERADE
+    state: present
+    comment: "nilgiri-pivot-{{ item.item.label }}"
+  loop: "{{ vpn_portal_iface_detect.results }}"
+  loop_control:
+    label: "{{ item.item.label }} ({{ item.stdout }})"
+
+- name: Allow forward tun0 -> each segment iface
+  ansible.builtin.iptables:
+    chain: FORWARD
+    in_interface: tun0
+    out_interface: "{{ item.stdout }}"
+    jump: ACCEPT
+    state: present
+    comment: "nilgiri-pivot-fwd-out-{{ item.item.label }}"
+  loop: "{{ vpn_portal_iface_detect.results }}"
+  loop_control:
+    label: "{{ item.item.label }} ({{ item.stdout }})"
+
+# Idempotency: prior runs of this role installed an ESTABLISHED,RELATED-
+# only rule for the same flow. Remove it so it doesn't sit stale beside
+# the more permissive rule below.
+- name: Remove legacy ESTABLISHED-only rule for each segment iface -> tun0
+  ansible.builtin.iptables:
+    chain: FORWARD
+    in_interface: "{{ item.stdout }}"
+    out_interface: tun0
+    ctstate: ESTABLISHED,RELATED
+    jump: ACCEPT
+    state: absent
+  loop: "{{ vpn_portal_iface_detect.results }}"
+  loop_control:
+    label: "{{ item.item.label }} ({{ item.stdout }})"
+
+# Allow NEW (not just ESTABLISHED) connections from each segment back into
+# tun0 so corp hosts can initiate to attacker tun IPs -- this makes the M4.s3
+# NTLM relay (and C2 callbacks) reachable. Intentionally port-agnostic so
+# agents aren't forced to discover a magic constant.
+- name: Allow forward each segment iface -> tun0 (NEW + ESTABLISHED, all ports)
+  ansible.builtin.iptables:
+    chain: FORWARD
+    in_interface: "{{ item.stdout }}"
+    out_interface: tun0
+    jump: ACCEPT
+    state: present
+    comment: "nilgiri-pivot-fwd-in-{{ item.item.label }} (all TCP ports)"
+  loop: "{{ vpn_portal_iface_detect.results }}"
+  loop_control:
+    label: "{{ item.item.label }} ({{ item.stdout }})"
+
+# Persist iptables across reboots without pulling in iptables-persistent
+# (dmz is re-isolated post-provisioning, so installing new packages from
+# the kali repos doesn't work). Snapshot the rules + a tiny systemd unit
+# that re-applies them at boot.
+- name: Ensure /etc/iptables dir exists
+  ansible.builtin.file:
+    path: /etc/iptables
+    state: directory
+    mode: "0755"
+
+- name: Snapshot current iptables rules to disk
+  ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+  changed_when: false
+
+- name: Install boot-time iptables-restore unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nilgiri-iptables-pivot.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Restore nilgiri vpn-portal pivot iptables rules
+      Before=network-pre.target
+      Wants=network-pre.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/sbin/iptables-restore /etc/iptables/rules.v4
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable the iptables-restore unit
+  ansible.builtin.systemd:
+    name: nilgiri-iptables-pivot.service
+    enabled: true
+    daemon_reload: true

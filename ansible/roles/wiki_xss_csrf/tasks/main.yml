@@ -1,0 +1,30 @@
+---
+# wiki_xss_csrf (M4) -- top-level. Runs on wiki.charlie; the fs.charlie
+# bits are delegated by the playbook to fs.charlie (see m4_wiki_xss_csrf.yml).
+#
+# Prereqs (enforced by the m4 makefile target):
+#   1. scripts/m4_bake_installers.sh has staged the MediaWiki stack +
+#      KeePassXC under C:\Windows\Setup\wiki\ and C:\Windows\Setup\keepass\
+#   2. The helpdesk_admin_user role has run on dc1.charlie (so the
+#      domain user exists + the playbook has its SID as a hostvar)
+
+# ---- Sanity: stack staged? --------------------------------------------
+- name: Verify staged wiki stack present
+  ansible.windows.win_stat:
+    path: 'C:\Windows\Setup\wiki\mediawiki.tar.gz'
+  register: wiki_stack_staged
+
+- name: Fail if wiki stack not staged
+  ansible.builtin.fail:
+    msg: >-
+      MediaWiki stack not staged at C:\Windows\Setup\wiki\. Run
+      `make m4-bake` first (or `bash scripts/m4_bake_installers.sh`).
+  when: not wiki_stack_staged.stat.exists
+
+# ---- MediaWiki stack on wiki.charlie ----------------------------------
+- name: Deploy MediaWiki (IIS + PHP + MariaDB + core)
+  ansible.builtin.include_tasks: mediawiki.yml
+
+# ---- Wiki content (sysop namespace, bait article, M3.s3, M4.s1) -------
+- name: Seed wiki content (users, sysop namespace, bait, M3.s3, M4.s1)
+  ansible.builtin.include_tasks: wiki_content.yml

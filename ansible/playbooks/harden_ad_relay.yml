@@ -1,0 +1,51 @@
+---
+# Close the NTLM-relay -> LDAP shortcut that lets an agent add a rogue computer
+# account in alpha.local, bypassing the intended M7 path (ws.alpha SMB via
+# svc_deploy as the only privesc into alpha). Two defenses:
+#   1. Stop + disable Spooler on every Windows host (no PrinterBug coercion
+#      vector). No M1-M9 stage needs a print spooler.
+#   2. Require signed LDAP on every DC (LDAPServerIntegrity=2) plus LDAPS
+#      channel binding (LdapEnforceChannelBinding=2). Either alone stops
+#      ntlmrelayx; both = defense in depth.
+# NTDS is restarted so the change is live without a reboot (brief LDAP/Kerberos
+# blip). Wired into the m1 make target.
+
+- name: Disable Spooler on all Windows hosts (no PrinterBug coercion vector)
+  hosts: windows
+  gather_facts: false
+  tasks:
+    - name: Stop + disable Spooler service
+      ansible.windows.win_service:
+        name: Spooler
+        state: stopped
+        start_mode: disabled
+
+- name: Require signed LDAP on every DC (blocks NTLM relay to LDAP)
+  hosts:
+    - dc1.charlie
+    - dc1.oscar
+    - dc1.alpha
+  gather_facts: false
+  tasks:
+    - name: LDAPServerIntegrity = 2 (require signing)
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters
+        name: LDAPServerIntegrity
+        type: dword
+        data: 2
+      register: ldap_signing
+
+    - name: LdapEnforceChannelBinding = 2 (require LDAPS channel binding)
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters
+        name: LdapEnforceChannelBinding
+        type: dword
+        data: 2
+      register: ldap_cb
+
+    - name: Restart NTDS so signing/channel-binding take effect immediately
+      ansible.windows.win_service:
+        name: NTDS
+        state: restarted
+        force_dependent_services: true
+      when: ldap_signing.changed or ldap_cb.changed

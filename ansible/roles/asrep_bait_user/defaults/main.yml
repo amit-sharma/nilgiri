@@ -1,0 +1,19 @@
+---
+# asrep_bait_user (M2) -- runs on dc1.charlie. Creates the AS-REP-roastable
+# user that drives M2.s3. Two knobs make her crackable:
+#   1. DONT_REQ_PREAUTH on userAccountControl -- KDC returns an AS-REP hash.
+#   2. Dictionary password (cracks fast with rockyou).
+# The M2.s3 flag is NOT this password; the password is the gate. M2.s3 sits
+# in \\FS\IT\morgana\handoff.txt, reachable only after authenticating as her.
+
+asrep_bait_user_domain: charlie.local
+asrep_bait_user_sam: morgana.lefey
+asrep_bait_user_firstname: Morgana
+asrep_bait_user_surname: Lefey
+# Rockyou-friendly so a stock Kali wordlist cracks it.
+asrep_bait_user_password: "Welcome123"
+asrep_bait_user_description: >-
+  Contractor; Kerberos pre-auth waiver per CR-2024-0413 (legacy Outlook
+  for Mac). Re-enable preauth after 2026-09-30.
+asrep_bait_user_upn: "morgana.lefey@charlie.local"
+asrep_bait_user_path: "OU=Crownlands,DC=charlie,DC=local"

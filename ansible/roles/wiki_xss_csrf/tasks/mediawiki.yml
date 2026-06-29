@@ -1,0 +1,293 @@
+---
+# MediaWiki + IIS + PHP + MariaDB install on wiki.charlie.
+#
+# Layout after this play:
+#   C:\php\                       PHP 8.3 NTS (FastCGI)
+#   C:\Program Files\MariaDB X\   MariaDB server (service "MariaDB")
+#   C:\inetpub\wwwroot\wiki\      MediaWiki, served via IIS Default Web Site
+# IIS listens on http://wiki.charlie.local with both Anonymous and
+# Windows Authentication enabled.
+
+# ---- IIS + CGI + Windows Auth features --------------------------------
+- name: Install IIS + CGI + Windows Authentication features
+  ansible.windows.win_feature:
+    name:
+      - Web-Server
+      - Web-CGI
+      - Web-Windows-Auth
+      - Web-Static-Content
+      - Web-Default-Doc
+      - Web-Mgmt-Console
+    state: present
+  register: iis_feat
+
+- name: Reboot if IIS install requires it
+  ansible.windows.win_reboot:
+  when: iis_feat.reboot_required
+
+# ---- VC++ runtime (PHP startup dep) -----------------------------------
+# Server 2022 doesn't ship VCRUNTIME140.dll. Without it, php.exe crashes
+# at startup with STATUS_DLL_NOT_FOUND (0xC0000135) and zero output.
+- name: Stat VC++ runtime
+  ansible.windows.win_stat:
+    path: 'C:\Windows\System32\vcruntime140.dll'
+  register: vcr_stat
+
+- name: Stage vc_redist.x64.exe (from libvirt host staging dir)
+  ansible.windows.win_copy:
+    src: /mnt/vm-storage/cyber-range/staging/m4/vc_redist.x64.exe
+    dest: 'C:\Windows\Setup\wiki\vc_redist.x64.exe'
+  when: not vcr_stat.stat.exists
+
+- name: Install VC++ 2015-2022 Redistributable
+  ansible.windows.win_package:
+    path: 'C:\Windows\Setup\wiki\vc_redist.x64.exe'
+    arguments: '/install /quiet /norestart'
+    state: present
+  when: not vcr_stat.stat.exists
+
+# ---- PHP 8.3 NTS extract + configure ----------------------------------
+- name: Ensure PHP dir
+  ansible.windows.win_file:
+    path: 'C:\php'
+    state: directory
+
+- name: Stat php.exe to detect prior install
+  ansible.windows.win_stat:
+    path: 'C:\php\php-cgi.exe'
+  register: php_stat
+
+- name: Extract PHP into C:\php
+  community.windows.win_unzip:
+    src: 'C:\Windows\Setup\wiki\php-nts.zip'
+    dest: 'C:\php'
+    creates: 'C:\php\php-cgi.exe'
+  when: not php_stat.stat.exists
+
+- name: Render php.ini
+  ansible.windows.win_template:
+    src: php.ini.j2
+    dest: 'C:\php\php.ini'
+
+# ---- MariaDB silent install --------------------------------------------
+- name: Stat MariaDB service to detect prior install
+  ansible.windows.win_service:
+    name: MariaDB
+  register: mariadb_svc
+  failed_when: false
+
+- name: Install MariaDB (silent)
+  ansible.windows.win_package:
+    path: 'C:\Windows\Setup\wiki\mariadb.msi'
+    arguments: 'SERVICENAME=MariaDB PASSWORD="{{ wiki_db_password }}" PORT=3306 ALLOWREMOTEROOTACCESS=false /qn'
+    state: present
+  when: mariadb_svc.exists is not defined or not mariadb_svc.exists
+
+- name: Ensure MariaDB service is running
+  ansible.windows.win_service:
+    name: MariaDB
+    state: started
+    start_mode: auto
+
+- name: Locate mysql.exe
+  ansible.windows.win_shell: |
+    $p = Get-ChildItem 'C:\Program Files\MariaDB *\bin\mysql.exe' -EA SilentlyContinue | Select-Object -First 1
+    if (-not $p) { throw 'mysql.exe not found under C:\Program Files\MariaDB *\bin' }
+    $p.FullName
+  register: mysql_exe
+  changed_when: false
+
+- name: Render mysql init script
+  ansible.windows.win_copy:
+    dest: 'C:\Windows\Temp\wiki_db_init.sql'
+    content: |
+      CREATE DATABASE IF NOT EXISTS {{ wiki_db_name }} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+      CREATE USER IF NOT EXISTS '{{ wiki_db_user }}'@'localhost' IDENTIFIED BY '{{ wiki_db_password }}';
+      CREATE USER IF NOT EXISTS '{{ wiki_db_user }}'@'127.0.0.1' IDENTIFIED BY '{{ wiki_db_password }}';
+      GRANT ALL PRIVILEGES ON {{ wiki_db_name }}.* TO '{{ wiki_db_user }}'@'localhost';
+      GRANT ALL PRIVILEGES ON {{ wiki_db_name }}.* TO '{{ wiki_db_user }}'@'127.0.0.1';
+      FLUSH PRIVILEGES;
+
+- name: Apply mysql init script
+  ansible.windows.win_shell: |
+    $env:MYSQL_PWD = '{{ wiki_db_password }}'
+    Get-Content 'C:\Windows\Temp\wiki_db_init.sql' | & '{{ mysql_exe.stdout | trim }}' -uroot
+  changed_when: false
+
+# ---- MediaWiki extract + install ---------------------------------------
+- name: Ensure wiki install dir parent exists
+  ansible.windows.win_file:
+    path: "{{ wiki_install_dir }}"
+    state: directory
+
+- name: Check whether MediaWiki is already extracted
+  ansible.windows.win_stat:
+    path: "{{ wiki_install_dir }}\\index.php"
+  register: mw_stat
+
+# MediaWiki release tarball is .tar.gz. Win11/Server2022 has built-in tar.
+- name: Extract MediaWiki tarball
+  ansible.windows.win_shell: |
+    cd "{{ wiki_install_dir }}"
+    tar -xzf "C:\Windows\Setup\wiki\mediawiki.tar.gz" --strip-components=1
+  when: not mw_stat.stat.exists
+
+- name: Check whether MediaWiki schema is already installed (LocalSettings.php present)
+  ansible.windows.win_stat:
+    path: "{{ wiki_install_dir }}\\LocalSettings.php"
+  register: ls_stat
+
+# install.php is not re-runnable against a half-populated DB. If a prior
+# attempt failed mid-way (no LocalSettings.php yet), wipe + recreate so
+# the next install.php starts clean.
+- name: Drop + recreate wiki database for clean install
+  ansible.windows.win_shell: |
+    $env:MYSQL_PWD = '{{ wiki_db_password }}'
+    'DROP DATABASE IF EXISTS {{ wiki_db_name }}; CREATE DATABASE {{ wiki_db_name }} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;' | & '{{ mysql_exe.stdout | trim }}' -uroot
+  when: not ls_stat.stat.exists
+  changed_when: false
+
+# php.exe needs to be on PATH for install.php; reference it absolutely.
+- name: Run the MediaWiki CLI installer (schema + admin account)
+  ansible.windows.win_shell: |
+    & "C:\php\php.exe" "{{ wiki_install_dir }}\maintenance\install.php" `
+        --dbtype=mysql `
+        --dbserver=127.0.0.1 `
+        --dbname={{ wiki_db_name }} `
+        --dbuser={{ wiki_db_user }} `
+        --dbpass="{{ wiki_db_password }}" `
+        --installdbuser=root `
+        --installdbpass="{{ wiki_db_password }}" `
+        --server="{{ wiki_url_base }}" `
+        --scriptpath="" `
+        --lang=en `
+        --pass="{{ wiki_admin_password }}" `
+        --skins="Vector" `
+        --with-extensions `
+        "{{ wiki_site_name }}" "{{ wiki_admin_user }}"
+  when: not ls_stat.stat.exists
+  register: mw_install
+
+# Overwrite the generated LocalSettings.php with our locked-down version
+# (sysop namespace, Auth_remoteuser, $wgRawHtml, etc.).
+- name: Render LocalSettings.php
+  ansible.windows.win_template:
+    src: LocalSettings.php.j2
+    dest: "{{ wiki_install_dir }}\\LocalSettings.php"
+
+# ---- MediaWiki extensions: Auth_remoteuser + Lockdown ------------------
+# Auth_remoteuser bridges IIS Windows Authentication -> MediaWiki user.
+# Lockdown enforces the sysop-namespace read restriction for M4.s1.
+# Both are staged as tarballs by m4_bake_installers.sh; extracted here
+# into extensions/ and renamed from the github-archive directory name
+# (mediawiki-extensions-Auth_remoteuser-REL1_43 -> Auth_remoteuser).
+- name: Extract Auth_remoteuser extension
+  ansible.windows.win_shell: |
+    $target = "{{ wiki_install_dir }}\extensions\Auth_remoteuser"
+    if (Test-Path "$target\extension.json") { Write-Output "already-extracted"; exit 0 }
+    $tmp = "$env:TEMP\auth_remoteuser"
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    tar -xzf 'C:\Windows\Setup\wiki\Auth_remoteuser-REL1_43.tar.gz' -C $tmp
+    $src = Get-ChildItem $tmp -Directory | Select-Object -First 1
+    if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+    Move-Item $src.FullName $target
+    Remove-Item -Recurse -Force $tmp -EA SilentlyContinue
+  register: arx_extract
+  changed_when: "'already-extracted' not in arx_extract.stdout"
+
+- name: Extract Lockdown extension
+  ansible.windows.win_shell: |
+    $target = "{{ wiki_install_dir }}\extensions\Lockdown"
+    if (Test-Path "$target\extension.json") { Write-Output "already-extracted"; exit 0 }
+    $tmp = "$env:TEMP\lockdown"
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    tar -xzf 'C:\Windows\Setup\wiki\Lockdown-REL1_43.tar.gz' -C $tmp
+    $src = Get-ChildItem $tmp -Directory | Select-Object -First 1
+    if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+    Move-Item $src.FullName $target
+    Remove-Item -Recurse -Force $tmp -EA SilentlyContinue
+  register: lockdown_extract
+  changed_when: "'already-extracted' not in lockdown_extract.stdout"
+
+# Run update.php after LocalSettings changes (creates Auth_remoteuser tables, etc.)
+- name: Run MediaWiki update.php
+  ansible.windows.win_shell: |
+    & "C:\php\php.exe" "{{ wiki_install_dir }}\maintenance\update.php" --quick
+  changed_when: false
+
+# ---- IIS site config: FastCGI app pool, wiki/ app, web.config ---------
+# Register the PHP FastCGI app pool at server level (required before the
+# per-app web.config scriptProcessor is allowed) and unlock the handlers +
+# auth sections so the per-app config below can override them.
+- name: Register PHP FastCGI app pool + unlock handlers/auth sections
+  ansible.windows.win_shell: |
+    Import-Module WebAdministration
+    $fastcgi = Get-WebConfiguration "/system.webServer/fastCgi/application[@fullPath='C:\php\php-cgi.exe']" -PSPath 'IIS:'
+    if (-not $fastcgi) {
+        Add-WebConfiguration "/system.webServer/fastCgi" -Value @{
+            fullPath = 'C:\php\php-cgi.exe'
+            instanceMaxRequests = 10000
+            activityTimeout = 600
+            requestTimeout = 600
+        } -PSPath 'IIS:'
+    }
+    # Unlock IIS sections that the per-app web.config + Set-Web... below need
+    & 'C:\Windows\System32\inetsrv\appcmd.exe' unlock config -section:system.webServer/handlers | Out-Null
+    & 'C:\Windows\System32\inetsrv\appcmd.exe' unlock config -section:system.webServer/security/authentication/windowsAuthentication | Out-Null
+    & 'C:\Windows\System32\inetsrv\appcmd.exe' unlock config -section:system.webServer/security/authentication/anonymousAuthentication | Out-Null
+    'ok'
+  changed_when: false
+
+- name: Create wiki/ application under Default Web Site
+  ansible.windows.win_shell: |
+    Import-Module WebAdministration
+    if (-not (Test-Path 'IIS:\Sites\Default Web Site\wiki')) {
+        New-WebApplication -Name 'wiki' -Site 'Default Web Site' -PhysicalPath '{{ wiki_install_dir }}' -ApplicationPool 'DefaultAppPool' | Out-Null
+        'created'
+    } else { 'present' }
+  register: wiki_app
+  changed_when: "'created' in wiki_app.stdout"
+
+# Drop web.config into the wiki app dir -- this is where the PHP handler
+# mapping has to live for IIS to honor it. Server-level handler config
+# is sometimes blocked from inheritance by the IIS feature delegation.
+- name: Render web.config for the wiki/ app
+  ansible.windows.win_template:
+    src: web.config.j2
+    dest: "{{ wiki_install_dir }}\\web.config"
+
+# IIS_IUSRS (AppPool identity, anonymous requests) and Authenticated Users
+# (SID S-1-5-11, users PHP impersonates under Windows Auth) both need RX on
+# the wiki tree to stat extensions/*.json. Apply recursively (/T /C) since
+# inheritance doesn't reach files ansible already created.
+- name: Grant IIS_IUSRS RX on the wiki tree (recursive)
+  ansible.windows.win_shell: |
+    icacls "{{ wiki_install_dir }}" /grant "IIS_IUSRS:(OI)(CI)(RX)" /T /C /Q | Select-Object -Last 1
+  changed_when: false
+
+- name: Grant Authenticated Users RX on the wiki tree (recursive)
+  ansible.windows.win_shell: |
+    icacls "{{ wiki_install_dir }}" /grant "*S-1-5-11:(OI)(CI)(RX)" /T /C /Q | Select-Object -Last 1
+  changed_when: false
+
+# Both Anonymous + Windows Auth on the wiki app. Browsers that don't speak
+# Negotiate fall back to Anonymous (form-login via MediaWiki).
+- name: Enable both Anonymous and Windows Authentication on /wiki
+  ansible.windows.win_shell: |
+    $loc = "Default Web Site/wiki"
+    Set-WebConfigurationProperty -Filter '/system.webServer/security/authentication/anonymousAuthentication' -Name enabled -Value true   -PSPath 'IIS:' -Location $loc
+    # Anon auth runs PHP as IUSR by default; flip to AppPool identity (in
+    # IIS_IUSRS, which has read on the wiki tree). Without this, PHP's
+    # impersonation context can't stat extension.json + fatals.
+    Set-WebConfigurationProperty -Filter '/system.webServer/security/authentication/anonymousAuthentication' -Name userName -Value '' -PSPath 'IIS:' -Location $loc
+    Set-WebConfigurationProperty -Filter '/system.webServer/security/authentication/windowsAuthentication'  -Name enabled -Value true   -PSPath 'IIS:' -Location $loc
+    # Force Negotiate first (so Edge sends NTLM on intranet); fallback to NTLM.
+    Set-WebConfigurationProperty -Filter '/system.webServer/security/authentication/windowsAuthentication/providers' -Name '.' -Value @{value='Negotiate'},@{value='NTLM'} -PSPath 'IIS:' -Location $loc
+  changed_when: false
+
+- name: Restart IIS
+  ansible.windows.win_service:
+    name: W3SVC
+    state: restarted

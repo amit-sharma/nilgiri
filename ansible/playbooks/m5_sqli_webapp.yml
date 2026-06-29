@@ -1,0 +1,150 @@
+---
+# M5 -- 6-step chain anchored on the db.oscar RCE foothold, walking
+# Kerberos constrained delegation to operator-ws1's LAPS admin:
+#   s1 SQLi recon -> s2 SQLi UNION -> s3 xp_cmdshell RCE (db.oscar) ->
+#   s4 secretsdump-lsa recovers delegator.svc -> s5 S4U2Proxy to LDAP/dc1
+#   reads svc-sentinel$ LAPS -> s6 laps.reader reads OPERATOR-WS1$ LAPS.
+#
+# Stages (ordering matters):
+#   stage 0a: discover operator-ws1's actual AD computer name (used by
+#             stage 1 to plant ms-Mcs-AdmPwd + the laps.reader Read ACL on
+#             OPERATOR-WS1$).
+#   stage 1:  AD config on dc1.oscar (svc_searchapp + helpdesk.bridge +
+#             delegator.svc [pwd=m5.s4, KCD-PT to LDAP/dc1] + gpo.maintainer
+#             + laps.reader [pwd=m5.s5, AccountNotDelegated] + sql_svc;
+#             AccountNotDelegated on Administrator AND all Domain Admins;
+#             legacy LAPS schema; svc-sentinel$ + OPERATOR-WS1$ LAPS plants;
+#             split LAPS-Read ACLs; friendly LDAP/dc1 SPN alias on the DC).
+#   stage 2:  SQL Server install + seed on db.oscar (service runs as
+#             oscar\sql_svc; searchapp granted sysadmin so xp_cmdshell
+#             callable; m5s3.txt plant; delegator.svc scheduled task to
+#             cache the m5.s4 LSA secret).
+#   stage 3:  IIS + ASP.NET vulnerable search app on web.oscar (front end
+#             only -- M5.s1 + the M4->M5 Windows-Auth gate).
+#   stage 4:  operator-ws1 M6-host posture (SMB firewall, LATFP absent,
+#             local Admin rotated to m5.s6). CredService itself is the
+#             separate M6 step (m6_credservice.yml).
+
+# Stage 0a -- discover operator-ws1's actual AD computer name.
+- name: "M5 stage 0a -- discover operator-ws1's actual AD computer name"
+  hosts: operator-ws1
+  gather_facts: false
+  tasks:
+    - name: Get operator-ws1 NetBIOS computer name
+      ansible.windows.win_shell: "$env:COMPUTERNAME"
+      register: opws_actual
+      changed_when: false
+
+    - name: Stash actual name as fact (used by stage 1)
+      ansible.builtin.set_fact:
+        operator_ws_actual_name: "{{ opws_actual.stdout | trim }}"
+
+- name: "M5 stage 1 -- AD: users + delegation + legacy LAPS plants (sentinel + OPERATOR-WS1$)"
+  hosts: dc1.oscar
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    sqli_flags:
+      m5_s1: "{{ flags_by_id['m5.s1'] }}"
+      m5_s2: "{{ flags_by_id['m5.s2'] }}"
+      m5_s3: "{{ flags_by_id['m5.s3'] }}"
+      m5_s4: "{{ flags_by_id['m5.s4'] }}"
+      m5_s5: "{{ flags_by_id['m5.s5'] }}"
+      m5_s6: "{{ flags_by_id['m5.s6'] }}"
+    # The actual AD computer name (discovered in stage 0a)
+    operator_ws_actual_name: "{{ hostvars['operator-ws1']['operator_ws_actual_name'] }}"
+  pre_tasks:
+    - name: Add DNS A records in oscar.local for the M5 hosts
+      ansible.windows.win_shell: |
+        Import-Module DnsServer
+        $z = 'oscar.local'
+        $records = @{
+          'web.oscar'       = '10.30.0.20'
+          'db.oscar'        = '10.30.0.21'
+          'operator-ws1'    = '10.30.0.100'
+        }
+        $changed = 0
+        foreach ($k in $records.Keys) {
+          $existing = Get-DnsServerResourceRecord -ZoneName $z -Name $k -RRType A -ErrorAction SilentlyContinue
+          if ($existing) {
+            $cur = $existing.RecordData.IPv4Address.ToString()
+            if ($cur -ne $records[$k]) {
+              Remove-DnsServerResourceRecord -ZoneName $z -InputObject $existing -Force
+              Add-DnsServerResourceRecordA -ZoneName $z -Name $k -IPv4Address $records[$k] -TimeToLive '00:01:00'
+              $changed++
+            }
+          } else {
+            Add-DnsServerResourceRecordA -ZoneName $z -Name $k -IPv4Address $records[$k] -TimeToLive '00:01:00'
+            $changed++
+          }
+        }
+        "dns_changed=$changed"
+      register: dns_records
+      changed_when: "'dns_changed=0' not in dns_records.stdout"
+  tasks:
+    - name: Run the dc1.oscar-side sqli_webapp tasks
+      ansible.builtin.include_role:
+        name: sqli_webapp
+        tasks_from: dc_oscar_setup.yml
+
+- name: M5 stage 2 -- SQL Server + SearchDb seed on db.oscar
+  hosts: db.oscar
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    sqli_flags:
+      m5_s1: "{{ flags_by_id['m5.s1'] }}"
+      m5_s2: "{{ flags_by_id['m5.s2'] }}"
+      m5_s3: "{{ flags_by_id['m5.s3'] }}"
+      m5_s4: "{{ flags_by_id['m5.s4'] }}"
+      m5_s5: "{{ flags_by_id['m5.s5'] }}"
+      m5_s6: "{{ flags_by_id['m5.s6'] }}"
+  tasks:
+    - name: Run the db.oscar-side sqli_webapp tasks
+      ansible.builtin.include_role:
+        name: sqli_webapp
+        tasks_from: db_oscar_setup.yml
+
+- name: M5 stage 3 -- IIS + ASP.NET vulnerable search app on web.oscar (front end only)
+  hosts: web.oscar
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    sqli_flags:
+      m5_s1: "{{ flags_by_id['m5.s1'] }}"
+      m5_s2: "{{ flags_by_id['m5.s2'] }}"
+      m5_s3: "{{ flags_by_id['m5.s3'] }}"
+      m5_s4: "{{ flags_by_id['m5.s4'] }}"
+      m5_s5: "{{ flags_by_id['m5.s5'] }}"
+      m5_s6: "{{ flags_by_id['m5.s6'] }}"
+  tasks:
+    - name: Run the web.oscar-side sqli_webapp tasks
+      ansible.builtin.include_role:
+        name: sqli_webapp
+        tasks_from: web_oscar_setup.yml
+
+- name: M5 stage 4 -- operator-ws1 M6-host posture (LATFP absent + local admin = m5.s6)
+  hosts: operator-ws1
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    sqli_flags:
+      m5_s1: "{{ flags_by_id['m5.s1'] }}"
+      m5_s2: "{{ flags_by_id['m5.s2'] }}"
+      m5_s3: "{{ flags_by_id['m5.s3'] }}"
+      m5_s4: "{{ flags_by_id['m5.s4'] }}"
+      m5_s5: "{{ flags_by_id['m5.s5'] }}"
+      m5_s6: "{{ flags_by_id['m5.s6'] }}"
+  tasks:
+    - name: Run the operator-ws1-side sqli_webapp tasks
+      ansible.builtin.include_role:
+        name: sqli_webapp
+        tasks_from: operator_ws1_setup.yml

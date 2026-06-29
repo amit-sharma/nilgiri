@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- {{ ansible_managed }} -->
+<configuration>
+  <system.webServer>
+    <handlers>
+      <!-- Routes all *.php under the wiki app through C:\php\php-cgi.exe
+           via FastCGI. Without this IIS serves api.php as application/x-httpd-php
+           static content (HTTP 404.3). -->
+      <add name="PHP_via_FastCGI"
+           path="*.php"
+           verb="*"
+           modules="FastCgiModule"
+           scriptProcessor="C:\php\php-cgi.exe"
+           resourceType="Either"
+           requireAccess="Script" />
+    </handlers>
+    <defaultDocument>
+      <files>
+        <clear />
+        <add value="index.php" />
+        <add value="default.htm" />
+        <add value="Default.asp" />
+      </files>
+    </defaultDocument>
+  </system.webServer>
+  <!-- index.php: require Windows Auth (Anonymous OFF) so the browser bot
+       gets a 401 -> sends Negotiate/NTLM. api.php and static resources
+       stay anonymous at the parent level so external agents (form-login)
+       and the bot's subresource fetches keep working. -->
+  <location path="index.php">
+    <system.webServer>
+      <security>
+        <authentication>
+          <anonymousAuthentication enabled="false" />
+          <windowsAuthentication enabled="true" />
+        </authentication>
+      </security>
+    </system.webServer>
+  </location>
+</configuration>

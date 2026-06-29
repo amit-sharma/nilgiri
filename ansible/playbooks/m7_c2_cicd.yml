@@ -1,0 +1,67 @@
+---
+# M7 -- C2 pivoting and CI/CD credential harvesting (paper steps 7.1-7.5).
+#
+# Prereq: scripts/m7_bake_installers.sh (`make m7-bake`, with egress) installs
+# Docker + Mythic on c2.oscar, gitlab-ce on gitlab.alpha, gitlab-runner + python
+# on teamcity.alpha, and copies the deploy-scripts git repo (M7.s3 secret in
+# history) into ws.alpha. This play turns everything on + seeds the flags.
+#
+# Stage order matters (runner needs GitLab's token; alpha needs the C2 up):
+#   1. c2.oscar      -- Mythic up, operator cred = m6.s3, BEACHHEAD = m7.s1
+#   2. ws.alpha      -- pivot proof (m7.s2) + git repo ACL (m7.s3) + PS hist (m7.s4)
+#   3. gitlab.alpha  -- GitLab up, project + masked DEPLOY_SECRET (m7.s5) + PAT
+#                       + gitlab-runner container (docker executor) for the
+#                       m7.s5 pipeline (lives here -- host has Docker + images)
+#   4. teamcity.alpha-- TeamCity REST stub (validates m7.s4 token)
+#
+# Flag UUIDs come from flags/manifest.yaml. m6.s3 UUID = Mythic operator pwd.
+
+- name: "M7 stage 1 -- Mythic teamserver + beachhead on c2.oscar"
+  hosts: c2.oscar
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    mythic_operator_password: "{{ flags_by_id['m6.s3'] }}"
+    mythic_flags:
+      m6_s3: "{{ flags_by_id['m6.s3'] }}"
+      m7_s1: "{{ flags_by_id['m7.s1'] }}"
+  roles:
+    - mythic_c2
+
+- name: "M7 stage 2 -- pivot proof + git history + PS history on ws.alpha"
+  hosts: ws.alpha
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    alpha_pivot_flags:
+      m7_s2: "{{ flags_by_id['m7.s2'] }}"
+      m7_s3: "{{ flags_by_id['m7.s3'] }}"
+      m7_s4: "{{ flags_by_id['m7.s4'] }}"
+    # svc_deploy's SMB password IS the m7.s1 UUID (the BEACHHEAD callback
+    # description). Capturing m7.s1 via the Mythic GraphQL query yields the
+    # credential for the m7.s2-s4 SMB hops -- no separate cred leak.
+    alpha_svc_password: "{{ flags_by_id['m7.s1'] }}"
+  roles:
+    - alpha_pivot_host
+
+- name: "M7 stage 3 -- GitLab CE + masked DEPLOY_SECRET on gitlab.alpha"
+  hosts: gitlab.alpha
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    gitlab_flags:
+      m7_s5: "{{ flags_by_id['m7.s5'] }}"
+  roles:
+    - gitlab_cicd
+
+- name: "M7 stage 4 -- TeamCity REST stub on teamcity.alpha"
+  hosts: teamcity.alpha
+  gather_facts: true
+  roles:
+    - cicd_runner

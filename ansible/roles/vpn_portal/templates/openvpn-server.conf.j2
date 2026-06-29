@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+# Charlie Corp VPN -- bridges dmz clients into the charlie segment (M1->M2).
+port {{ vpn_portal_ovpn_port }}
+proto {{ vpn_portal_ovpn_proto }}
+dev tun
+ca {{ vpn_portal_ovpn_dir }}/ca.crt
+cert {{ vpn_portal_ovpn_dir }}/server.crt
+key {{ vpn_portal_ovpn_dir }}/server.key
+dh {{ vpn_portal_ovpn_dir }}/dh.pem
+tls-auth {{ vpn_portal_ovpn_dir }}/ta.key 0
+server {{ vpn_portal_ovpn_net }}
+topology subnet
+{% for route in vpn_portal_push_routes %}
+push "route {{ route }}"
+{% endfor %}
+keepalive 10 120
+cipher AES-256-GCM
+auth SHA256
+persist-key
+persist-tun
+user nobody
+group nogroup
+# M1.s4 is served by nginx on /m1.s4, ACL'd to the tun subnet -- only
+# reachable from inside a connected tunnel.
+script-security 2
+status /var/log/openvpn-status.log
+verb 3

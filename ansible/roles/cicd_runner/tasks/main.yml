@@ -1,0 +1,43 @@
+---
+# cicd_runner (M7) -- TeamCity REST stub on teamcity.alpha. A tiny python
+# service that validates the bearer token leaked in ws.alpha's PowerShell
+# history (M7.s4), making that credential real. The M7.s5 exfil path is via
+# GitLab (gitlab_cicd role on gitlab.alpha).
+
+- name: Verify python3 is present (kali ships it)
+  ansible.builtin.command: python3 --version
+  changed_when: false
+
+- name: Stage the TeamCity stub
+  ansible.builtin.template:
+    src: tc_stub.py.j2
+    dest: /opt/tc_stub.py
+    mode: "0755"
+  become: true
+
+- name: Install the TeamCity stub systemd unit
+  ansible.builtin.template:
+    src: tc-stub.service.j2
+    dest: /etc/systemd/system/nilgiri-tc-stub.service
+    mode: "0644"
+  become: true
+  register: tc_unit
+
+- name: Enable + (re)start the TeamCity stub
+  ansible.builtin.systemd:
+    name: nilgiri-tc-stub.service
+    enabled: true
+    daemon_reload: true
+    state: "{{ 'restarted' if tc_unit.changed else 'started' }}"
+  become: true
+
+- name: Smoke-test the stub answers (token-gated) on :{{ cicd_teamcity_port }}
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ cicd_teamcity_port }}/app/rest/builds"
+    headers:
+      Authorization: "Bearer {{ cicd_teamcity_token }}"
+    status_code: 200
+  register: tc_smoke
+  retries: 5
+  delay: 2
+  until: tc_smoke.status == 200

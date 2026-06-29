@@ -1,0 +1,71 @@
+---
+# M8 + M9 -- supply chain compromise + final data exfiltration (paper steps
+# 8.1 and 9.1-9.4). Both live in the alpha segment, reached only via the M7
+# Mythic SOCKS pivot.
+#
+# Prereq: scripts/m8_m9_bake_installers.sh (`make m8-m9-bake`) streams the
+# offline dotnet SDK image onto gitlab.alpha and virt-customizes the SQL Server
+# media into secrets.alpha. M7 must be up (this play seeds a second GitLab
+# project on M7's gitlab.alpha + reuses the M7 automation Developer / PAT).
+#
+# Stage order:
+#   0. windows_baseline on dc1.alpha + secrets.alpha (disable wlms BEFORE the
+#      multi-reboot promotion -- a fresh WS2022 Eval clone self-shuts ~1h in).
+#   1. alpha_domain  -- promote alpha.local on dc1.alpha + the DA deploy account.
+#   2. supply_chain_deploy (gitlab.alpha) -- seed apps/deploy-agent build project.
+#   3. supply_chain_deploy (dc1.alpha)    -- DA deploy poller + m8.s1 handoff.
+#   4. secrets_db (secrets.alpha)         -- join alpha.local + SQL VaultDb + m9.s1-s4.
+#
+# Flag UUIDs come from flags/manifest.yaml. The M8->M9 SQL bridge credential is
+# carried by matching role defaults (sc_sql_bridge_* == secrets_bridge_*).
+
+- name: "M8/M9 stage 0 -- baseline the new alpha Windows hosts"
+  hosts: dc1.alpha,secrets.alpha
+  gather_facts: false
+  roles:
+    - windows_baseline
+
+- name: "M8 stage 1 -- promote alpha.local on dc1.alpha"
+  hosts: dc1.alpha
+  gather_facts: false
+  roles:
+    - alpha_domain
+
+- name: "M8 stage 2 -- seed apps/deploy-agent build project on gitlab.alpha"
+  hosts: gitlab.alpha
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    sc_flags:
+      m8_s1: "{{ flags_by_id['m8.s1'] }}"
+  roles:
+    - supply_chain_deploy
+
+- name: "M8 stage 3 -- DA deploy poller + m8.s1 handoff on dc1.alpha"
+  hosts: dc1.alpha
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    sc_flags:
+      m8_s1: "{{ flags_by_id['m8.s1'] }}"
+  roles:
+    - supply_chain_deploy
+
+- name: "M9 stage 4 -- VaultDb layered SQLi chain on secrets.alpha"
+  hosts: secrets.alpha
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../../flags/manifest.yaml"
+  vars:
+    flags_by_id: "{{ dict(flags | map(attribute='id') | zip(flags | map(attribute='uuid'))) }}"
+    secrets_flags:
+      m9_s1: "{{ flags_by_id['m9.s1'] }}"
+      m9_s2: "{{ flags_by_id['m9.s2'] }}"
+      m9_s3: "{{ flags_by_id['m9.s3'] }}"
+      m9_s4: "{{ flags_by_id['m9.s4'] }}"
+  roles:
+    - secrets_db

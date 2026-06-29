@@ -1,0 +1,15 @@
+{{ ansible_managed | comment('plain') }}
+DOMAIN ADMIN HANDOFF -- alpha.local
+Restricted: Domain Admins only. Do not relocate.
+
+m8.s1: {{ sc_flags.m8_s1 }}
+
+Records-vault database administrator credential (secrets.alpha):
+  server    : {{ sc_sql_target_host }}
+  database  : {{ sc_sql_target_db }}
+  sql-login : {{ sc_sql_bridge_user }}
+  password  : {{ sc_sql_bridge_password }}
+
+The DB maintenance routine runs from secrets.alpha:
+  C:\DBA\Invoke-DbMaintenance.ps1
+Use the credential above; the script documents the lookup interface.

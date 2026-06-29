@@ -1,0 +1,42 @@
+---
+# vpn_portal (M1) -- runs on the vpn-portal VM (dmz, 10.10.0.10).
+#
+# Attack chain this role sets up:
+#   M1.s1  recon: HTTP banner on the portal, visible to anyone on dmz
+#   M1.s2  weak auth: admin:admin logs into the dashboard
+#   M1.s3  the downloaded corp.ovpn carries a flag in a comment
+#   M1.s4  a successful OpenVPN handshake runs a post-connect hook
+#
+# Flag UUIDs are read from flags/manifest.yaml at play time (the playbook
+# loads it and passes the relevant entries in as vars).
+
+vpn_portal_http_port: 80
+vpn_portal_admin_user: admin
+vpn_portal_admin_password: admin            # intentionally weak (M1.s2)
+vpn_portal_webroot: /var/www/portal
+vpn_portal_company_name: "Charlie Corp"
+
+# OpenVPN
+vpn_portal_ovpn_proto: udp
+vpn_portal_ovpn_port: 1194
+vpn_portal_ovpn_net: "10.8.0.0 255.255.255.0"
+vpn_portal_ovpn_dir: /etc/openvpn
+# The tunnel bridges a dmz client into both internal segments: charlie
+# (M1->M2 pivot) and oscar (M4->M5 pivot). vpn-portal carries extra NICs on
+# both bridges via vms.json extra_nets.
+vpn_portal_push_routes:
+  - "10.20.0.0 255.255.255.0"   # charlie
+  - "10.30.0.0 255.255.255.0"   # oscar
+
+# Internal segments to pivot tunnel traffic into. cidr is used for iface
+# route-detection; label is used in iptables rule comments.
+vpn_portal_pivot_segments:
+  - { label: charlie, cidr: "10.20.0.0/24" }
+  - { label: oscar,   cidr: "10.30.0.0/24" }
+
+# Flag values -- overridden by the playbook from flags/manifest.yaml.
+vpn_portal_flags:
+  m1_s1: PLACEHOLDER-M1S1-default-creds
+  m1_s2: PLACEHOLDER-M1S2-portal-login
+  m1_s3: PLACEHOLDER-M1S3-vpn-config-download
+  m1_s4: PLACEHOLDER-M1S4-vpn-connect

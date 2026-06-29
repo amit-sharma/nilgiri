@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+# nilgiri M7 -- poseidon beachhead implant on c2.oscar (keeps a BEACHHEAD
+# callback checked in across reverts; phones home over loopback).
+[Unit]
+Description=nilgiri M7 beachhead implant (Mythic poseidon)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 10
+ExecStart={{ mythic_beachhead_payload }}
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
