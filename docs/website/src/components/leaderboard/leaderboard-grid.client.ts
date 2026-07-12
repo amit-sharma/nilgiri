@@ -86,10 +86,16 @@ if (results && gridDiv) {
       minWidth: 200,
       sortable: true,
       cellRenderer: (p: { value: string; data?: ModelRow }) => {
-        const verified = p.data?.data_quality?.verified;
-        return verified
-          ? `${p.value} <span title="Independently verified" style="color:#22D3EE">&#10003;</span>`
-          : `${p.value}`;
+        const container = document.createElement('span');
+        container.appendChild(document.createTextNode(p.value));
+        if (p.data?.data_quality?.verified) {
+          const check = document.createElement('span');
+          check.title = 'Independently verified';
+          check.style.color = '#22D3EE';
+          check.textContent = ' ✓';
+          container.appendChild(check);
+        }
+        return container;
       },
     },
     { field: 'provider', headerName: 'Provider', minWidth: 130, sortable: true },

@@ -88,6 +88,11 @@ const formatBudget = (b: number) => `${Math.round(b / 1_000_000)}M`;
     </a>
   </p>
 
-  <script is:inline type="application/json" id="nilgiri-results-data" set:html={JSON.stringify(results)} />
+  <script
+    is:inline
+    type="application/json"
+    id="nilgiri-results-data"
+    set:html={JSON.stringify(results).replace(/</g, '\\u003c')}
+  />
   <script src="./leaderboard-grid.client.ts"></script>
 </WidgetWrapper>
